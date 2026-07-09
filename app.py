@@ -1,8 +1,8 @@
 """
-South Carolina MHC Placement Decision Tool (v9.4 advanced settings + multi previous deployment)
+South Carolina MHC Placement Decision Tool (v0.2 advanced settings + multi previous deployment)
 ===============================================================
 
-Best combined version composed from the two v9 drafts.
+
 
 Core changes retained and strengthened
 --------------------------------------
@@ -63,7 +63,6 @@ from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v9.6 coverage + travel-time ranking + distinct backups"
 
 
 # ===========================
@@ -4502,4 +4501,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
