@@ -63,7 +63,7 @@ from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v9.6 coverage + travel-time ranking + distinct backups"
+APP_VERSION = "v0.2"
 
 
 # ===========================
