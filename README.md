@@ -366,7 +366,7 @@ Tanim, S. H., White, D. L., Witrick, B., & Rennert, L. (2026). Optimizing mobile
 Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health Clinic Placement Decision Tool* (Version v0.2) [Web application and source code].
 
 - Web tool: https://sc-mhc-placement-decision.streamlit.app/
-- Source code: https://github.com/DMA-PRIME/SC-MHC-Placement
+- Source code: https://github.com/DMA-PRIME/SC-MHC-Placement-Decision
 - Accessed: [date accessed]
 
 ### BibTeX
@@ -388,7 +388,7 @@ Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health 
   author = {Tanim, Shakhawat H. and Iuricich, Federico and Rennert, Lior},
   year = {2026},
   version = {v0.2},
-  url = {https://github.com/DMA-PRIME/SC-MHC-Placement},
+  url = {https://github.com/DMA-PRIME/SC-MHC-Placement-Decision},
   note = {Web application: https://sc-mhc-placement-decision.streamlit.app/ accessed [date accessed]}
 }
 ```
@@ -402,7 +402,7 @@ Python 3.10 or 3.11 is recommended.
 ### Option 1: pip
 
 ```bash
-git clone https://github.com/DMA-PRIME/SC-MHC-Placement.git
+git clone https://github.com/DMA-PRIME/SC-MHC-Placement-Decision.git
 cd SC-MHC-Placement
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
@@ -413,7 +413,7 @@ python -m pip install streamlit pandas numpy geopandas shapely folium streamlit-
 ### Option 2: conda, recommended on Windows for geospatial dependencies
 
 ```bash
-git clone https://github.com/DMA-PRIME/SC-MHC-Placement.git
+git clone https://github.com/DMA-PRIME/SC-MHC-Placement-Decision.git
 cd SC-MHC-Placement
 conda create -n mhc-placement python=3.11 -y
 conda activate mhc-placement
