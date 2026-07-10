@@ -12,7 +12,7 @@ The published study demonstrated that optimized MHC placement can substantially 
 
 No installation is required to use the hosted version of the tool. Users can open the web app link, select the target variable, county or ZIP code, travel threshold, site types, number of MHCs, and then click **Calculate Optimal Sites**.
 
-Web tool link: https://sc-state-mhc-placement.streamlit.app/
+Web tool link: https://sc-mhc-placement-decision.streamlit.app/
 
 ## Table of contents
 
@@ -365,7 +365,7 @@ Tanim, S. H., White, D. L., Witrick, B., & Rennert, L. (2026). Optimizing mobile
 
 Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health Clinic Placement Decision Tool* (Version v0.2) [Web application and source code].
 
-- Web tool: https://sc-state-mhc-placement.streamlit.app/
+- Web tool: https://sc-mhc-placement-decision.streamlit.app/
 - Source code: https://github.com/DMA-PRIME/SC-MHC-Placement
 - Accessed: [date accessed]
 
@@ -389,7 +389,7 @@ Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health 
   year = {2026},
   version = {v0.2},
   url = {https://github.com/DMA-PRIME/SC-MHC-Placement},
-  note = {Web application: https://sc-state-mhc-placement.streamlit.app/; accessed [date accessed]}
+  note = {Web application: https://sc-mhc-placement-decision.streamlit.app/ accessed [date accessed]}
 }
 ```
 
