@@ -89,12 +89,7 @@ The app supports both pre-run and post-run exclusion workflows:
 
 If the candidate site data include feasibility fields, the app displays and exports them for field verification. Supported optional fields include:
 
-- `feasibility_status`
-- `parking`
-- `restroom`
-- `wifi`
-- `ada`
-- `permission`
+`feasibility_status` , `parking`, `restroom`, `wifi`, `ada`, `permission`
 
 These fields are not required for optimization, but they help translate model-selected sites into real-world deployment decisions.
 
