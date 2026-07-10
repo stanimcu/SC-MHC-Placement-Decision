@@ -63,7 +63,7 @@ from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v0.2"
+APP_VERSION = "v0.3"
 
 
 # ===========================
