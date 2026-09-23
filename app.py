@@ -3715,7 +3715,8 @@ def main():
 
             st.markdown("##### Map display")
             map_theme = st.radio("Theme", options=["Light", "Dark"], horizontal=True)
-            map_tiles = "CartoDB positron" if map_theme == "Light" else "CartoDB dark_matter"
+            #map_tiles = "CartoDB positron" if map_theme == "Light" else "CartoDB dark_matter"
+            map_tiles = "OpenStreetMap"
             show_demand_preview = st.toggle(
                 "Show block centroids before analysis",
                 value=DEFAULT_SHOW_DEMAND_PREVIEW,
