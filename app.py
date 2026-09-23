@@ -476,7 +476,7 @@ def render_folium_map(m: folium.Map, key: str = "map", height: int = 640):
 # ===========================
 # CONSTANTS
 # ===========================
-DEFAULT_USE_NETWORK = False
+DEFAULT_USE_NETWORK = True
 DEFAULT_NUM_MHCS = 3
 DEFAULT_NUM_ALTERNATIVE_PLANS = 3
 MAX_ALTERNATIVE_PLANS = 10
