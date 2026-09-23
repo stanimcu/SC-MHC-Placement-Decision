@@ -3349,7 +3349,7 @@ def build_coverage_matrix(
 # MAIN APP
 # ===========================
 def main():
-    st.title("🏥 South Carolina MHC Placement Decision Tool:")
+    st.title("🏥 South Carolina MHC Placement Decision Tool")
     st.caption(f"Version: {APP_VERSION}")
     st.markdown("**Optimizing healthcare accessibility for South Carolina's underserved communities.**")
 
