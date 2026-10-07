@@ -30,18 +30,13 @@ Author: Tanim
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
-import logging
 import os
 import re
 import tempfile
-import threading
-import time
 import warnings
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import folium
 from folium.plugins import Fullscreen
@@ -50,8 +45,6 @@ import networkx as nx
 import numpy as np
 import osmnx as ox
 import pandas as pd
-from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
-from scipy.spatial import cKDTree
 import streamlit as st
 import streamlit.components.v1 as components
 from pulp import LpMaximize, LpMinimize, LpProblem, LpStatus, LpVariable, lpSum, value
@@ -67,35 +60,16 @@ from shapely import wkt
 from shapely.geometry import Polygon
 from streamlit_folium import st_folium
 
-from config import JSON_PATH, MAX_OPTIMIZATION_TIME
+from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v0.6.2"
+APP_VERSION = "v0.4"
 
 
 # ===========================
 # OSMNX CACHE CONFIGURATION
 # ===========================
-def configure_osmnx_request_limits():
-    """Reduce per-request work without reducing the full road-network extent.
-
-    The HTTP timeout is deliberately longer than the server query timeout so
-    the server can finish processing and transmit its response. Requests still
-    run sequentially under OSMnx's normal rate-limit/slot handling.
-    """
-    ox.settings.requests_timeout = 300
-    current = getattr(ox.settings, "overpass_settings", "[out:json][timeout:{timeout}]{maxsize}")
-    # Preserve any other custom query settings, e.g. a historical snapshot date.
-    if re.search(r"\[timeout:[^\]]+\]", current):
-        current = re.sub(r"\[timeout:[^\]]+\]", "[timeout:180]", current)
-    else:
-        current += "[timeout:180]"
-    ox.settings.overpass_settings = current
-    current_area = float(getattr(ox.settings, "max_query_area_size", 2_500_000_000))
-    ox.settings.max_query_area_size = min(current_area, 500_000_000)
-
-
 def configure_osmnx_cache():
     """
     Configure OSMnx to use a writable absolute cache directory.
@@ -106,7 +80,6 @@ def configure_osmnx_cache():
     function moves the cache to a user/temp-local folder and falls back to no
     disk cache if no writable folder is available.
     """
-    configure_osmnx_request_limits()
     candidate_dirs = []
 
     custom_dir = os.environ.get("MHC_OSMNX_CACHE_DIR")
@@ -141,11 +114,13 @@ def configure_osmnx_cache():
             # Forward slashes are accepted by Windows and avoid fragile escaped
             # backslash display such as cache\b....json in error messages.
             ox.settings.cache_folder = cache_dir.as_posix()
+            ox.settings.requests_timeout = 180
             return cache_dir
         except Exception:
             continue
 
     ox.settings.use_cache = False
+    ox.settings.requests_timeout = 180
     return None
 
 
@@ -217,7 +192,9 @@ TARGET_CATEGORIES = {
         "Worker Population",
         "Veteran Population",
     ],
-    "Disease burden": ["Disease burden (placeholder)"],
+    "Disease burden": [
+        "Disease burden (placeholder)",
+    ],
 }
 
 # ===========================
@@ -534,7 +511,7 @@ SC_HIGHWAY_SPEEDS_KMH = {
     "road": 40,
 }
 SC_FALLBACK_SPEED_KMH = 40
-EDGE_PENALTY_SECONDS = 5  # A fixed delay per graph edge, not turn-aware routing.
+TURN_PENALTY_SECONDS = 5
 CIRCUITY_FACTOR = 1.20
 DEFAULT_DRIVING_SPEED = 25
 MAX_SNAP_DIST_M = 2000
@@ -544,12 +521,6 @@ NETWORK_QUERY_BUFFER_M_DRIVE = 5000
 NETWORK_QUERY_BUFFER_M_WALK = 2000
 # Initial search envelope; expand if the downloaded graph contains faster edges.
 NETWORK_SEARCH_SPEED_KMH = 160.0
-OVERPASS_URLS = (
-    "https://overpass.private.coffee/api",
-    "https://overpass-api.de/api",
-)
-GRAPH_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-NETWORK_FALLBACK_CACHE_TTL_SECONDS = 10 * 60
 MAX_TIEBREAKER_ASSIGNMENT_PAIRS = 60000
 
 COVERAGE_ONLY_DIVERSITY_MODE = "Rank by coverage only"
@@ -601,8 +572,6 @@ for skey, default in [
     ("prev_zip", None),
     ("view_mode", "county"),
     ("site_metrics_lookup", {}),
-    ("optimization_notices", []),
-    ("analysis_timings", []),
 ]:
     if skey not in st.session_state:
         st.session_state[skey] = default
@@ -634,8 +603,6 @@ def reset_analysis_state():
         "previous_covered_dem_ids": set(),
         "previous_covered_value": 0.0,
         "remaining_target": None,
-        "optimization_notices": [],
-        "analysis_timings": [],
     }.items():
         st.session_state[key] = value
 
@@ -810,11 +777,6 @@ def get_ordered_zip_choices(
     return zip_choices
 
 
-@st.cache_data(show_spinner=False, max_entries=24)
-def cached_zip_choices(data_signature, selected_county_fips, target_var, _zip_gdf, _county_gdf, _demand_df):
-    return get_ordered_zip_choices(_zip_gdf, selected_county_fips, _county_gdf, _demand_df, target_var)
-
-
 def get_candidates_in_zip(candidates_df, selected_zip, zip_geom):
     if "zip_join" in candidates_df.columns and candidates_df["zip_join"].notna().any():
         candidates = candidates_df[candidates_df["zip_join"] == selected_zip].copy()
@@ -839,38 +801,8 @@ def travel_search_radius_m(max_time, network_type="drive", use_network=False, se
     return float(speed) * max(float(max_time), 0.0) / 60.0 * 1000.0 * 1.02 + allowance
 
 
-def coordinate_unit_vectors(lats, lons):
-    lat, lon = np.radians(lats), np.radians(lons)
-    return np.column_stack((np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)))
-
-
-@st.cache_resource(show_spinner=False, max_entries=2)
-def get_demand_spatial_index(data_signature, _demand_df):
-    """Index exact spherical distances once per dataset revision; never mutate this index."""
-    lats = pd.to_numeric(_demand_df["latitude"], errors="coerce").to_numpy(dtype=float)
-    lons = pd.to_numeric(_demand_df["longitude"], errors="coerce").to_numpy(dtype=float)
-    valid = np.isfinite(lats) & np.isfinite(lons) & (np.abs(lats) <= 90) & (np.abs(lons) <= 180)
-    valid &= ~_demand_df["dem_idx"].duplicated().to_numpy()
-    positions = np.flatnonzero(valid)
-    tree = cKDTree(coordinate_unit_vectors(lats[valid], lons[valid])) if positions.size else None
-    return tree, positions
-
-
-def select_demand_search_area(demand_df, candidates_df, max_time, network_type="drive", use_network=False, search_speed_kmh=None, spatial_index=None):
+def select_demand_search_area(demand_df, candidates_df, max_time, network_type="drive", use_network=False, search_speed_kmh=None):
     """Search the full loaded demand dataset around eligible sites, without a ZIP filter."""
-    if spatial_index is not None:
-        tree, positions = spatial_index
-        if tree is None or candidates_df.empty:
-            return demand_df.iloc[:0].copy().reset_index(drop=True)
-        radius = travel_search_radius_m(max_time, network_type, use_network, search_speed_kmh)
-        chord = 2.0 * np.sin(min(radius / 6371000.0, np.pi) / 2.0)
-        lats = pd.to_numeric(candidates_df["latitude"], errors="coerce").to_numpy(dtype=float)
-        lons = pd.to_numeric(candidates_df["longitude"], errors="coerce").to_numpy(dtype=float)
-        valid = np.isfinite(lats) & np.isfinite(lons) & (np.abs(lats) <= 90) & (np.abs(lons) <= 180)
-        keep = np.zeros(len(positions), dtype=bool)
-        for xyz in coordinate_unit_vectors(lats[valid], lons[valid]):
-            keep[tree.query_ball_point(xyz, chord, eps=0.0)] = True
-        return demand_df.iloc[positions[keep]].reset_index(drop=True).copy()
     demand = demand_df.drop_duplicates(subset="dem_idx").copy()
     lats = pd.to_numeric(demand["latitude"], errors="coerce").to_numpy(dtype=float)
     lons = pd.to_numeric(demand["longitude"], errors="coerce").to_numpy(dtype=float)
@@ -1055,7 +987,6 @@ def apply_previous_deployment_adjustment(
     use_network,
     G,
     network_access_direction=NETWORK_ACCESS_DIRECTION,
-    previous_covered_mask=None,
 ):
     """Zero out demand already covered by a previous deployment.
 
@@ -1074,11 +1005,7 @@ def apply_previous_deployment_adjustment(
     if previous_deployment_df is None or len(previous_deployment_df) == 0 or n_dem == 0:
         return adjusted_matrix, adjusted_weights, previous_mask, 0.0, float(adjusted_weights.sum())
 
-    if previous_covered_mask is not None:
-        previous_mask = np.asarray(previous_covered_mask, dtype=bool)
-        if previous_mask.shape != (n_dem,):
-            raise ValueError("Previous-deployment coverage does not match the demand rows.")
-    else:
+    try:
         previous_coverage, _, _, _ = build_coverage_matrix(
             previous_deployment_df,
             demand_reset,
@@ -1091,6 +1018,8 @@ def apply_previous_deployment_adjustment(
         )
         if previous_coverage.shape[1] == n_dem and previous_coverage.shape[0] > 0:
             previous_mask = previous_coverage.astype(bool).any(axis=0)
+    except Exception:
+        previous_mask = np.zeros(n_dem, dtype=bool)
 
     previous_covered_value = float(base_weights[previous_mask].sum()) if np.any(previous_mask) else 0.0
     if np.any(previous_mask):
@@ -1139,7 +1068,7 @@ def make_analysis_params(
 
     return {
         "selected_zip": str(selected_zip),
-        "demand_scope": "travel_time_across_zip_boundaries_v2",
+        "demand_scope": "travel_time_across_zip_boundaries_v1",
         "target_var": str(target_var),
         "selected_types": tuple(sorted(map(str, selected_types))),
         "excluded_cand_ids": tuple(sorted(map(int, excluded_cand_ids))),
@@ -1546,47 +1475,39 @@ def get_overlap_limit(num_facilities, diversity_mode):
 
 
 
-class OptimizationError(RuntimeError):
-    pass
-
-
-def add_optimization_notice(notices, message):
-    if notices is not None and message not in notices:
-        notices.append(message)
-
-
-def model_has_proven_optimum(model):
-    # In PuLP 3.x, CBC can set status=1 for a time-limited incumbent; sol_status=2 then.
-    return model.status == 1 and getattr(model, "sol_status", None) == 1
-
-
 def build_pulp_solver_candidates(msg=False):
-    """Use available CBC solvers with an explicit time limit and zero requested gap."""
+    """Return available PuLP solver objects, preferring the current CBC interface."""
     solvers = []
-    for solver_cls in (PULP_CBC_CMD, COIN_CMD):
+    for solver_cls in (COIN_CMD, PULP_CBC_CMD):
         if solver_cls is None:
             continue
         try:
-            solver = solver_cls(msg=bool(msg), timeLimit=float(MAX_OPTIMIZATION_TIME), gapRel=0.0)
-            if solver.available():
-                solvers.append(solver)
+            solvers.append(solver_cls(msg=1 if msg else 0))
+        except TypeError:
+            try:
+                solvers.append(solver_cls(msg=bool(msg)))
+            except Exception:
+                continue
         except Exception:
             continue
     return solvers
 
 
 def solve_pulp_model(model, msg=False):
+    """Solve a PuLP model with a robust CBC/default-solver fallback."""
     last_error = None
     for solver in build_pulp_solver_candidates(msg=msg):
         try:
             return model.solve(solver)
         except Exception as exc:
             last_error = exc
-    raise OptimizationError(
-        "CBC could not solve the model. Check the solver installation and available memory; "
-        "this is not evidence that the deployment problem is infeasible."
-    ) from last_error
 
+    try:
+        return model.solve()
+    except Exception:
+        if last_error is not None:
+            raise last_error
+        raise
 
 def solve_maxcover_once(
     coverage_matrix,
@@ -1595,7 +1516,6 @@ def solve_maxcover_once(
     previous_solutions=None,
     diversity_mode="Rank by coverage only",
     travel_time_matrix=None,
-    notices=None,
 ):
     """
     Solve one MCLP instance with an optional lexicographic travel-time tie-breaker.
@@ -1633,14 +1553,14 @@ def solve_maxcover_once(
     add_plan_selection_constraints(model, x, n_fac, p, previous_solutions, diversity_mode)
     add_coverage_constraints(model, x, y, coverage_matrix)
 
-    solve_pulp_model(model, msg=False)
-    if model.status == -1:  # Proven infeasible under these diversity constraints.
+    try:
+        solve_pulp_model(model, msg=False)
+    except Exception:
         return []
-    if not model_has_proven_optimum(model):
-        raise OptimizationError(
-            f"Best coverage was not proven within the solver limit ({MAX_OPTIMIZATION_TIME} seconds per solve). "
-            "Reduce the candidate set or fleet size, or adjust the solver time limit in config.py."
-        )
+
+    status_name = LpStatus.get(model.status, "")
+    if status_name not in {"Optimal", "Feasible"}:
+        return []
 
     selected_stage1 = [
         i
@@ -1667,7 +1587,7 @@ def solve_maxcover_once(
     finite_cover_pairs = [
         (int(i), int(j))
         for i, j in zip(*np.where(coverage_matrix == 1))
-        if demand_weights[int(j)] > 0 and np.isfinite(travel_time_matrix[int(i), int(j)])
+        if np.isfinite(travel_time_matrix[int(i), int(j)])
     ]
     if not finite_cover_pairs:
         return selected_stage1
@@ -1676,16 +1596,13 @@ def solve_maxcover_once(
         # Keep the primary MCLP exact and skip only the secondary travel-time
         # tie-breaker when the assignment model would be too large for an
         # interactive Streamlit run.
-        add_optimization_notice(notices, "Coverage was optimized, but the travel-time tie-break was skipped for a large model. Displayed travel times compare the generated plans only.")
         return selected_stage1
 
     tie_model = LpProblem("Max_Coverage_Min_Travel_Tie_Break", LpMinimize)
     x2 = LpVariable.dicts("facility", range(n_fac), cat="Binary")
     y2 = LpVariable.dicts("covered", range(n_dem), cat="Binary")
-    # Given binary site/coverage choices, each demand assignment is a simplex.
-    # Continuous assignments attain the same minimum at a nearest selected site.
     z = {
-        (i, j): LpVariable(f"assign_{i}_{j}", lowBound=0.0, upBound=1.0, cat="Continuous")
+        (i, j): LpVariable(f"assign_{i}_{j}", cat="Binary")
         for i, j in finite_cover_pairs
     }
 
@@ -1713,12 +1630,11 @@ def solve_maxcover_once(
 
     try:
         solve_pulp_model(tie_model, msg=False)
-    except OptimizationError:
-        add_optimization_notice(notices, "The travel-time tie-break could not be completed. The coverage-optimal plan was retained.")
+    except Exception:
         return selected_stage1
 
-    if not model_has_proven_optimum(tie_model):
-        add_optimization_notice(notices, "The travel-time tie-break was not proven before the solver limit. The coverage-optimal plan was retained.")
+    tie_status_name = LpStatus.get(tie_model.status, "")
+    if tie_status_name not in {"Optimal", "Feasible"}:
         return selected_stage1
 
     selected_stage2 = [
@@ -1743,7 +1659,6 @@ def solve_top_k_maxcover(
     total_target,
     diversity_mode="Rank by coverage only",
     travel_time_matrix=None,
-    notices=None,
 ):
     """
     Generate ranked deployment plans.
@@ -1807,13 +1722,11 @@ def solve_top_k_maxcover(
             previous_solutions=previous_solutions,
             diversity_mode=solver_mode,
             travel_time_matrix=travel_time_matrix,
-            notices=notices,
         )
 
         if not selected_indices and solver_mode != "Rank by coverage only":
             # Strict diversity can become infeasible. Fall back to no-good cuts so
             # users still receive backup plans rather than an empty result.
-            add_optimization_notice(notices, "Site-diversity restrictions were relaxed to produce additional backup plans.")
             selected_indices = solve_maxcover_once(
                 coverage_matrix=coverage_matrix,
                 demand_weights=demand_weights,
@@ -1821,7 +1734,6 @@ def solve_top_k_maxcover(
                 previous_solutions=previous_solutions,
                 diversity_mode="Rank by coverage only",
                 travel_time_matrix=travel_time_matrix,
-                notices=notices,
             )
 
         if not selected_indices:
@@ -1905,8 +1817,6 @@ def run_resource_sweep(
     total_target,
     max_mhcs,
     travel_time_matrix=None,
-    existing_plan=None,
-    notices=None,
 ):
     """
     Run exact best-plan MCLP for 1..max_mhcs.
@@ -1921,31 +1831,22 @@ def run_resource_sweep(
     covered_col = f"Covered {target_label}"
 
     for mhcs in range(1, max_mhcs + 1):
-        if existing_plan is not None and len(existing_plan["selected_indices"]) == mhcs:
-            plans = [existing_plan]
-        else:
-            try:
-                plans = solve_top_k_maxcover(
-                    coverage_matrix=coverage_matrix,
-                    demand_weights=demand_weights,
-                    num_facilities=mhcs,
-                    num_alternative_plans=1,
-                    candidates_reset=candidates_reset,
-                    demand_reset=demand_reset,
-                    target_var=target_var,
-                    total_target=total_target,
-                    diversity_mode=COVERAGE_ONLY_DIVERSITY_MODE,
-                    # Coverage remains primary; travel time breaks ties among equal-coverage plans.
-                    travel_time_matrix=travel_time_matrix,
-                    notices=notices,
-                )
-            except OptimizationError as exc:
-                add_optimization_notice(notices, f"Fleet scenarios stopped at {mhcs} MHCs: {exc}")
-                break
+        plans = solve_top_k_maxcover(
+            coverage_matrix=coverage_matrix,
+            demand_weights=demand_weights,
+            num_facilities=mhcs,
+            num_alternative_plans=1,
+            candidates_reset=candidates_reset,
+            demand_reset=demand_reset,
+            target_var=target_var,
+            total_target=total_target,
+            diversity_mode=COVERAGE_ONLY_DIVERSITY_MODE,
+            # Coverage remains primary; travel time breaks ties among equal-coverage plans.
+            travel_time_matrix=travel_time_matrix,
+        )
 
         if not plans:
-            add_optimization_notice(notices, f"No proven scenario was obtained for {mhcs} MHCs; later fleet scenarios were skipped.")
-            break
+            continue
 
         plan = plans[0]
         exact_value = float(plan["covered_pop"])
@@ -2173,8 +2074,8 @@ def build_all_plan_sites_export(plans, target_label):
 # ===========================
 # DATA LOADING
 # ===========================
-@st.cache_data(max_entries=2)
-def load_data(json_path: Path, data_signature=None):
+@st.cache_data
+def load_data(json_path: Path):
     with open(json_path, "r") as f:
         data = json.load(f)
 
@@ -3178,19 +3079,13 @@ def snap_points_to_nodes(G, lons, lats, max_snap_dist_m=MAX_SNAP_DIST_M):
         nodes[dists > max_snap_dist_m] = None
         out[:] = nodes
         return out
-    except Exception as bulk_error:
-        failed_points = 0
+    except Exception:
         for i, (lo, la) in enumerate(zip(lons, lats)):
             try:
                 n, d = ox.distance.nearest_nodes(G, lo, la, return_dist=True)
                 out[i] = n if d <= max_snap_dist_m else None
             except Exception:
                 out[i] = None
-                failed_points += 1
-        if failed_points:
-            raise RuntimeError(
-                "Road-node lookup failed; incomplete road coverage was discarded."
-            ) from bulk_error
         return out
 
 
@@ -3252,7 +3147,7 @@ def preprocess_network_speeds(G, network_type="drive"):
             length_m = float(data.get("length", 0.0) or 0.0)
             seconds = (length_m / 1000.0 / WALKING_SPEED_KMH) * 3600.0
             data["speed_kph"] = WALKING_SPEED_KMH
-            data[NETWORK_TRAVEL_TIME_WEIGHT] = (seconds + EDGE_PENALTY_SECONDS) / 60.0
+            data[NETWORK_TRAVEL_TIME_WEIGHT] = (seconds + TURN_PENALTY_SECONDS) / 60.0
         return G
 
     try:
@@ -3289,7 +3184,7 @@ def preprocess_network_speeds(G, network_type="drive"):
             length_m = float(data.get("length", 0.0) or 0.0)
             speed_kph = float(data.get("speed_kph", SC_FALLBACK_SPEED_KMH) or SC_FALLBACK_SPEED_KMH)
             raw_seconds = (length_m / 1000.0 / speed_kph) * 3600.0
-        data[NETWORK_TRAVEL_TIME_WEIGHT] = (float(raw_seconds) + EDGE_PENALTY_SECONDS) / 60.0
+        data[NETWORK_TRAVEL_TIME_WEIGHT] = (float(raw_seconds) + TURN_PENALTY_SECONDS) / 60.0
 
     return G
 
@@ -3310,119 +3205,6 @@ def _download_osm_graph_with_cache_fallback(download_func):
 
 
 @st.cache_resource(show_spinner=False)
-def get_osmnx_download_lock():
-    """OSMnx settings are global; serialize downloads across Streamlit sessions."""
-    return threading.RLock()
-
-
-class RoadNetworkUnavailable(RuntimeError):
-    """All configured Overpass connections failed."""
-
-
-def get_overpass_urls():
-    # A custom provider is used exclusively, including providers with authentication.
-    custom_url = os.environ.get("MHC_OVERPASS_URL", "").strip()
-    urls = [custom_url] if custom_url else list(OVERPASS_URLS)
-    normalized = []
-    for url in urls:
-        url = url.rstrip("/")
-        if url.endswith("/interpreter"):
-            url = url[:-len("/interpreter")]
-        parsed = urlsplit(url)
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise ValueError("The Overpass URL must be an HTTPS API base URL.")
-        if url not in normalized:
-            normalized.append(url)
-    return normalized
-
-
-def osm_graph_cache_path(query_key):
-    """Cache by exact extent and travel mode, independent of the responding server."""
-    if OSMNX_CACHE_DIR is None:
-        return None
-    payload = json.dumps(
-        {"format": 1, "osmnx": getattr(ox, "__version__", "unknown"), "query": query_key},
-        sort_keys=True,
-    )
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    directory = Path(OSMNX_CACHE_DIR) / "graphs"
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None
-    return directory / f"{digest}.graphml"
-
-
-def download_osm_graph_with_recovery(download_func, query_key):
-    """Reuse a saved graph, then try each provider once on transport failures.
-
-    OSMnx keeps its own server slot/rate-limit handling. HTTP rejection and model
-    errors are not retried against another provider by this wrapper.
-    """
-    with get_osmnx_download_lock():
-        cache_path = osm_graph_cache_path(query_key)
-        if cache_path is not None:
-            try:
-                if cache_path.is_file() and time.time() - cache_path.stat().st_mtime < GRAPH_CACHE_TTL_SECONDS:
-                    return ox.load_graphml(cache_path)
-            except Exception:
-                logging.getLogger(__name__).warning("Saved road-network cache could not be read; downloading again.")
-
-        settings_names = ("overpass_url", "overpass_endpoint", "http_user_agent")
-        previous_settings = {name: getattr(ox.settings, name) for name in settings_names if hasattr(ox.settings, name)}
-        endpoint_settings = [name for name in ("overpass_url", "overpass_endpoint") if name in previous_settings]
-        if not endpoint_settings:
-            raise RuntimeError("This OSMnx version does not expose a supported Overpass URL setting.")
-        failures = []
-        last_error = None
-        try:
-            ox.settings.http_user_agent = "SC-MHC-Placement-Decision/0.6.1 (OSMnx)"
-            for endpoint in get_overpass_urls():
-                for name in endpoint_settings:
-                    setattr(ox.settings, name, endpoint)
-                attempt_started = time.perf_counter()
-                try:
-                    graph = _download_osm_graph_with_cache_fallback(download_func)
-                except (RequestsConnectionError, RequestsTimeout) as exc:
-                    host = urlsplit(endpoint).hostname
-                    elapsed = time.perf_counter() - attempt_started
-                    failures.append(f"{host}: {type(exc).__name__} after {elapsed:.0f}s")
-                    last_error = exc
-                    logging.getLogger(__name__).warning(
-                        "Road-data request failed at %s after %.1fs (%s). Full underlying error follows.",
-                        host, elapsed, type(exc).__name__, exc_info=True,
-                    )
-                    continue
-
-                # Save raw graph data; each caller reapplies the app's speed model.
-                if cache_path is not None:
-                    temporary_path = None
-                    try:
-                        with tempfile.NamedTemporaryFile(dir=cache_path.parent, suffix=".graphml", delete=False) as handle:
-                            temporary_path = Path(handle.name)
-                        ox.save_graphml(graph, filepath=temporary_path)
-                        temporary_path.replace(cache_path)
-                    except Exception:
-                        logging.getLogger(__name__).warning("Road network loaded, but its local cache could not be saved.")
-                    finally:
-                        if temporary_path is not None:
-                            try:
-                                temporary_path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
-                return graph
-        finally:
-            for name in settings_names:
-                if name in previous_settings:
-                    setattr(ox.settings, name, previous_settings[name])
-                elif hasattr(ox.settings, name):
-                    delattr(ox.settings, name)
-        raise RoadNetworkUnavailable(
-            "Road data could not be retrieved from the configured providers. " + "; ".join(failures)
-        ) from last_error
-
-
-@st.cache_resource(show_spinner=False, ttl=GRAPH_CACHE_TTL_SECONDS, max_entries=4)
 def get_osm_graph(center_lat, center_lon, dist_m, network_type):
     """Download/load an OSM network graph around a point with a cache-error fallback."""
     def _download():
@@ -3434,11 +3216,11 @@ def get_osm_graph(center_lat, center_lon, dist_m, network_type):
             truncate_by_edge=True,
         )
 
-    G = download_osm_graph_with_recovery(_download, ["point", center_lat, center_lon, int(dist_m), network_type])
+    G = _download_osm_graph_with_cache_fallback(_download)
     return preprocess_network_speeds(G, network_type)
 
 
-@st.cache_resource(show_spinner=False, ttl=GRAPH_CACHE_TTL_SECONDS, max_entries=4)
+@st.cache_resource(show_spinner=False)
 def get_osm_graph_for_polygon(polygon_wkt, network_type):
     """Download/load an OSM network graph for a buffered analysis polygon."""
     polygon = wkt.loads(polygon_wkt)
@@ -3451,7 +3233,7 @@ def get_osm_graph_for_polygon(polygon_wkt, network_type):
             truncate_by_edge=True,
         )
 
-    G = download_osm_graph_with_recovery(_download, ["polygon", polygon_wkt, network_type])
+    G = _download_osm_graph_with_cache_fallback(_download)
     return preprocess_network_speeds(G, network_type)
 
 
@@ -3510,15 +3292,16 @@ def load_travel_time_graph(zip_geom, sites_df, max_time, network_type):
     for _ in range(3):
         radius = travel_search_radius_m(max_time, network_type, True, speed_bound) + extra_buffer
         polygon = build_network_query_polygon(None, sites_df, None, radius)
-        if polygon is None or polygon.is_empty:
+        try:
+            if polygon is None or polygon.is_empty:
+                raise ValueError("Network query polygon could not be created.")
+            graph = get_osm_graph_for_polygon(polygon.wkt, network_type)
+        except Exception:
             center = zip_geom.centroid
             distance = estimate_required_graph_dist_m(
                 center.y, center.x, sites_df, None, min_dist=15000, buffer_m=radius
             )
             graph = get_osm_graph(center.y, center.x, int(distance), network_type)
-        else:
-            # A connection error must not trigger another, larger request to the same providers.
-            graph = get_osm_graph_for_polygon(polygon.wkt, network_type)
 
         observed_speed = 0.0
         for _, _, data in graph.edges(data=True):
@@ -3623,16 +3406,9 @@ def build_coverage_matrix(
             except TypeError:
                 routing_graph = G.reverse()
 
-        demand_codes, unique_demand_nodes = pd.factorize(dem_nodes, sort=False)
-        valid_demand = demand_codes >= 0
-        origin_rows = {}
         for i, origin in enumerate(fac_nodes):
             if origin is None:
                 continue
-            origin_rows.setdefault(origin, []).append(i)
-
-        # Candidate venues snapped to the same road node have identical network travel times.
-        for origin, row_indices in origin_rows.items():
             try:
                 lengths = nx.single_source_dijkstra_path_length(
                     routing_graph,
@@ -3640,17 +3416,16 @@ def build_coverage_matrix(
                     cutoff=float(max_time),
                     weight=NETWORK_TRAVEL_TIME_WEIGHT,
                 )
-            except Exception as exc:
-                raise RuntimeError("Shortest-path routing failed; partial coverage results were discarded.") from exc
+            except Exception:
+                continue
 
-            unique_times = np.fromiter(
-                (lengths.get(node, np.inf) for node in unique_demand_nodes), dtype=float,
-                count=len(unique_demand_nodes),
-            )
-            row_times = np.full(n_dem, np.inf)
-            row_times[valid_demand] = unique_times[demand_codes[valid_demand]]
-            travel_time_matrix[row_indices, :] = row_times
-            coverage[row_indices, :] = row_times <= float(max_time)
+            for j, node in enumerate(dem_nodes):
+                if node is None:
+                    continue
+                tt = float(lengths.get(node, np.inf))
+                if np.isfinite(tt):
+                    travel_time_matrix[i, j] = tt
+                    coverage[i, j] = 1 if tt <= float(max_time) else 0
 
         if return_travel_time:
             return coverage, candidates_reset, demand_reset, travel_time_matrix
@@ -3661,96 +3436,6 @@ def build_coverage_matrix(
     if return_travel_time:
         return coverage, candidates_reset, demand_reset, tt.astype(float)
     return coverage, candidates_reset, demand_reset
-
-
-def make_routing_key(data_signature, selected_zip, candidates, previous_sites, max_time, mode, use_network):
-    """Target weights, fleet size, and number of alternatives do not affect routing."""
-    def points(df):
-        if df is None or df.empty:
-            return []
-        columns = [col for col in ("cand_idx", "latitude", "longitude") if col in df.columns]
-        return df[columns].to_json(orient="split", index=False, double_precision=15)
-    payload = ["routing-v062-auto-fallback", data_signature, str(selected_zip), points(candidates), points(previous_sites),
-               float(max_time), str(mode), bool(use_network)]
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def calculate_routing_for_method(candidates, demand, previous_sites, max_time, mode,
-                                 use_network, spatial_index, graph=None, search_speed=None):
-    """Build a complete, consistent routing result using exactly one method."""
-    if use_network and graph is None:
-        raise RuntimeError("Road routing did not produce a usable graph.")
-    search = select_demand_search_area(
-        demand, candidates, max_time, mode, use_network, search_speed, spatial_index
-    )
-    coverage, candidate_rows, demand_rows, times = build_coverage_matrix(
-        candidates, search, max_time, network_type=mode, use_network=use_network, G=graph,
-        return_travel_time=True, network_access_direction=NETWORK_ACCESS_DIRECTION,
-    )
-    coverage, demand_rows, times = retain_reachable_demand(coverage, demand_rows, times)
-    previous_mask = np.zeros(len(demand_rows), dtype=bool)
-    if previous_sites is not None and not previous_sites.empty and not demand_rows.empty:
-        previous_coverage, _, _ = build_coverage_matrix(
-            previous_sites, demand_rows, max_time, network_type=mode, use_network=use_network,
-            G=graph, network_access_direction=NETWORK_ACCESS_DIRECTION,
-        )
-        previous_mask = previous_coverage.astype(bool).any(axis=0)
-    return {
-        "coverage": coverage, "candidates": candidate_rows, "demand": demand_rows,
-        "times": times, "previous_mask": previous_mask,
-        "method": ("Road Network (OSM, demand-to-site free-flow travel time)" if use_network
-                   else "Manhattan-style Distance (estimated travel times)"),
-        "used_network": bool(use_network), "fallback_used": False,
-        "created_at": time.time(),
-    }
-
-
-def prepare_routing_data(candidates, demand, previous_sites, zip_geom, max_time, mode, use_network, spatial_index):
-    """Try roads, then rebuild the entire analysis with Manhattan on road failure.
-
-    Includes graph download/preparation, current sites, and previous deployment
-    routing. Partial road results are discarded, so no plan mixes the methods.
-    """
-    fallback_used = False
-    if use_network:
-        try:
-            extent_sites = candidates
-            if previous_sites is not None and not previous_sites.empty:
-                extent_sites = pd.concat([candidates, previous_sites], ignore_index=True, sort=False)
-            graph, search_speed = load_travel_time_graph(zip_geom, extent_sites, max_time, mode)
-            return calculate_routing_for_method(
-                candidates, demand, previous_sites, max_time, mode, True, spatial_index,
-                graph=graph, search_speed=search_speed,
-            )
-        except Exception:
-            # Only this road-routing pipeline is caught; solver/data errors are
-            # still surfaced by their normal checks. Release local graph refs.
-            graph = None
-            logging.getLogger(__name__).warning(
-                "Road routing failed. Recomputing all travel times and previous-deployment "
-                "coverage using Manhattan-style estimates.", exc_info=True,
-            )
-            fallback_used = True
-
-    result = calculate_routing_for_method(
-        candidates, demand, previous_sites, max_time, mode, False, spatial_index,
-    )
-    if fallback_used:
-        result["fallback_used"] = True
-        result["method"] = "Manhattan-style Distance (automatic fallback; estimated travel times)"
-    return result
-
-
-def routing_data_is_reusable(cached_routing, routing_key, now=None):
-    """Reuse fallback briefly; retry roads on a later Calculate after recovery."""
-    if not cached_routing or cached_routing.get("key") != routing_key:
-        return False
-    data = cached_routing.get("data", {})
-    if "created_at" not in data:
-        return False
-    ttl = NETWORK_FALLBACK_CACHE_TTL_SECONDS if data.get("fallback_used", False) else GRAPH_CACHE_TTL_SECONDS
-    age = (time.time() if now is None else float(now)) - data["created_at"]
-    return 0 <= age < ttl
 
 
 # ===========================
@@ -3778,9 +3463,8 @@ def main():
 
             **Current objective:** Maximize the selected demand variable covered
             within the selected travel-time threshold. Plans are ranked
-            by highest covered demand first. A second optimization minimizes weighted
-            nearest travel time among equal-coverage solutions when the model size
-            and solver limit permit it; any skipped or incomplete tie-break is reported. Backup
+            lexicographically: highest covered demand first, then lowest weighted
+            average nearest travel time among equal-coverage solutions. Backup
             plans default to a site-distinct setting so alternatives do not simply
             repeat most of the same locations.
 
@@ -3815,25 +3499,16 @@ def main():
 
             **Network Analysis (optional):** OSM road network accessibility using
             free-flow travel times. Missing speeds are imputed by road class and
-            travel is evaluated toward the MHC site. Coordinates are snapped to road
-            nodes within 2 km. Travel from the centroid/site to its snapped node is
-            not included. A 5-second delay is applied to every graph edge; this is
-            not a turn-specific or live-traffic model. Capacity, queues, and clinic
-            operating hours are not modeled: coverage means potential geographic access.
+            travel is evaluated from demand block centroids to the selected MHC site.
 
-            **Manhattan-style Distance (when road routing is off or fails):** Projected rectilinear distance
+            **Manhattan-style Distance (default):** Projected rectilinear distance
             x 1.2 circuity factor, converted to travel time. This is a fast
-            approximation. If road downloads or routing fail, the full calculation,
-            including previous-deployment coverage, is rebuilt with this method.
-            The displayed method and exports identify automatic fallback results.
+            approximation, not a replacement for road-network routing.
         """)
 
     st.divider()
 
     try:
-        data_path = Path(JSON_PATH).resolve()
-        data_stat = data_path.stat()
-        data_signature = (str(data_path), int(data_stat.st_mtime_ns), int(data_stat.st_size))
         with st.spinner("Loading geospatial data..."):
             (
                 zip_gdf,
@@ -3842,7 +3517,7 @@ def main():
                 county_gdf,
                 zip_county_map,
                 global_type_colors,
-            ) = load_data(data_path, data_signature)
+            ) = load_data(JSON_PATH)
     except Exception as e:
         st.error(f"Error loading data: {e}")
         st.stop()
@@ -3891,8 +3566,12 @@ def main():
             )
             selected_county_fips = county_name_to_fips.get(selected_county_name)
 
-            zip_choices = cached_zip_choices(
-                data_signature, selected_county_fips, target_var, zip_gdf, county_gdf, demand_df
+            zip_choices = get_ordered_zip_choices(
+                zip_gdf,
+                selected_county_fips,
+                county_gdf,
+                demand_df=demand_df,
+                target_var=target_var,
             )
 
             if zip_choices.empty:
@@ -4150,9 +3829,9 @@ def main():
             st.markdown("##### Fleet size scenario analysis")
             run_resource_overview = st.toggle(
                 "Show fleet size scenario analysis after optimization",
-                value=False,
+                value=True,
                 help=(
-                    "Optional extra calculations. Leave off for faster main results. Runs best-plan coverage analysis from 1 through the selected scenario maximum. "
+                    "Runs best-plan coverage analysis from 1 through the selected scenario maximum. "
                     "The default maximum is 5 MHCs, capped by available candidate sites."
                 ),
             )
@@ -4204,6 +3883,9 @@ def main():
                     value=default_time,
                 )
 
+            st.caption(f"{max_facilities:,} candidate sites remain after filters/exclusions.")
+            st.caption("Candidate sites stay in the selected ZIP. Demand coverage follows travel time across ZIP boundaries, using blocks available in the loaded dataset.")
+
     if st.session_state.prev_county != selected_county_fips:
         st.session_state.view_mode = "county" if selected_county_fips is not None else "zip"
         st.session_state.review_excluded_cand_ids = set()
@@ -4248,8 +3930,6 @@ def main():
         exclude_previous_deployment_site=exclude_previous_deployment_site,
     )
 
-    current_analysis_params["data_signature"] = data_signature
-
     if (
         st.session_state.analysis_complete
         and st.session_state.analysis_params is not None
@@ -4264,10 +3944,8 @@ def main():
         reset_analysis_state()
         st.session_state.view_mode = "analysis"
 
-    spatial_index = get_demand_spatial_index(data_signature, demand_df)
     demand_search = select_demand_search_area(
-        demand_df, candidates_in_zip, time_threshold, travel_mode, use_network,
-        spatial_index=spatial_index,
+        demand_df, candidates_in_zip, time_threshold, travel_mode, use_network
     )
 
     result_title = build_result_title(
@@ -4294,44 +3972,59 @@ def main():
             st.session_state.view_mode = "zip"
         else:
             with st.spinner(f"Optimizing ranked deployment plans for: {target_label}..."):
-                analysis_timings = []
-                optimization_notices = []
-                started = time.perf_counter()
+                G = None
+                method_used = "Manhattan-style Distance"
                 previous_deployment_locations = previous_deployment_records_from_df(previous_deployment_df)
-                routing_key = make_routing_key(
-                    data_signature, selected_zip, candidates_in_zip, previous_deployment_df,
-                    time_threshold, travel_mode, use_network,
-                )
-                cached_routing = st.session_state.get("last_routing_data")
-                routing_reused = routing_data_is_reusable(cached_routing, routing_key)
-                try:
-                    if routing_reused:
-                        routed = cached_routing["data"]
-                    else:
-                        routed = prepare_routing_data(
-                            candidates_in_zip, demand_df, previous_deployment_df, zip_geom,
-                            time_threshold, travel_mode, use_network, spatial_index,
+
+                if use_network:
+                    try:
+                        network_extent_candidates = candidates_in_zip
+                        if previous_deployment_df is not None and not previous_deployment_df.empty:
+                            network_extent_candidates = pd.concat(
+                                [candidates_in_zip, previous_deployment_df], ignore_index=True, sort=False
+                            )
+                        with st.spinner("Loading roads within the travel-time search area..."):
+                            G, search_speed = load_travel_time_graph(
+                                zip_geom, network_extent_candidates, time_threshold, travel_mode
+                            )
+                        demand_search = select_demand_search_area(
+                            demand_df, candidates_in_zip, time_threshold, travel_mode, True, search_speed
                         )
-                        # Keep only the latest matrix set for this session to limit memory use.
-                        st.session_state.last_routing_data = {"key": routing_key, "data": routed}
-                except Exception as exc:
-                    st.session_state.view_mode = "zip"
-                    st.error(
-                        "Travel-time calculation failed. No deployment plan was calculated. "
-                        "Road-routing failures automatically fall back to Manhattan estimates; "
-                        "the calculation could not finish with the available data. "
-                        f"Details: {exc}"
-                    )
+                        method_used = "Road Network (OSM, demand-to-site free-flow travel time)"
+                    except Exception as e:
+                        G = None
+                        st.warning(
+                            "Road network failed, so the app is using Manhattan-style distance instead. "
+                            f"Details: {e}"
+                        )
+                        demand_search = select_demand_search_area(
+                            demand_df, candidates_in_zip, time_threshold, travel_mode, False
+                        )
+
+                raw_coverage_matrix, candidates_reset, demand_reset, travel_time_matrix = build_coverage_matrix(
+                    candidates_in_zip,
+                    demand_search,
+                    time_threshold,
+                    network_type=travel_mode,
+                    use_network=use_network,
+                    G=G,
+                    return_travel_time=True,
+                    network_access_direction=NETWORK_ACCESS_DIRECTION,
+                )
+
+                if target_var not in demand_reset.columns:
+                    st.error(f"The selected target variable is not available in the demand data: {target_var}")
                     st.stop()
-                raw_coverage_matrix = routed["coverage"]
-                candidates_reset = routed["candidates"]
-                demand_reset = routed["demand"]
-                travel_time_matrix = routed["times"]
-                method_used = routed["method"]
-                analysis_timings.append({
-                    "Stage": "Roads and travel times" + (" (reused)" if routing_reused else ""),
-                    "Seconds": round(time.perf_counter() - started, 3),
-                })
+
+                if use_network and G is not None and not np.isfinite(travel_time_matrix).any():
+                    st.warning(
+                        "Road-network routing produced no routable candidate-to-demand pairs. "
+                        "Check coordinates, OSM road coverage, and the snap-distance threshold."
+                    )
+
+                raw_coverage_matrix, demand_reset, travel_time_matrix = retain_reachable_demand(
+                    raw_coverage_matrix, demand_reset, travel_time_matrix
+                )
                 if demand_reset.empty:
                     st.session_state.view_mode = "zip"
                     st.warning("No loaded census block centroids are reachable from the eligible sites within this travel time. Increase the time limit or change the candidate sites.")
@@ -4357,10 +4050,9 @@ def main():
                         previous_deployment_df=previous_deployment_df,
                         time_threshold=time_threshold,
                         travel_mode=travel_mode,
-                        use_network=routed["used_network"],
-                        G=None,
+                        use_network=use_network,
+                        G=G,
                         network_access_direction=NETWORK_ACCESS_DIRECTION,
-                        previous_covered_mask=routed["previous_mask"],
                     )
                 )
                 previous_covered_dem_ids = (
@@ -4369,33 +4061,25 @@ def main():
                     else set()
                 )
 
-                if optimization_total_target <= 0:
-                    if not is_first_deployment:
-                        st.info("No additional target demand remains in the reachable area after accounting for previous deployments.")
-                    else:
-                        st.info("The selected measure has no positive demand in the reachable area. Choose another measure or change the study area.")
-                    st.stop()
-
-                optimization_started = time.perf_counter()
-                try:
-                    plans = solve_top_k_maxcover(
-                        coverage_matrix=coverage_matrix,
-                        demand_weights=demand_weights,
-                        num_facilities=int(num_mhcs),
-                        num_alternative_plans=int(num_alternative_plans),
-                        candidates_reset=candidates_reset,
-                        demand_reset=demand_reset,
-                        target_var=target_var,
-                        total_target=optimization_total_target,
-                        diversity_mode=diversity_mode,
-                        # Coverage remains primary; travel time now breaks ties and orders equal-coverage plans.
-                        travel_time_matrix=travel_time_matrix,
-                        notices=optimization_notices,
+                if not is_first_deployment and optimization_total_target <= 0:
+                    st.warning(
+                        "The previous deployment already covers all selected target demand within the current travel-time threshold. "
+                        "The generated results may show zero additional coverage."
                     )
-                except OptimizationError as exc:
-                    st.error(str(exc))
-                    st.stop()
-                analysis_timings.append({"Stage": "Deployment plans", "Seconds": round(time.perf_counter() - optimization_started, 3)})
+
+                plans = solve_top_k_maxcover(
+                    coverage_matrix=coverage_matrix,
+                    demand_weights=demand_weights,
+                    num_facilities=int(num_mhcs),
+                    num_alternative_plans=int(num_alternative_plans),
+                    candidates_reset=candidates_reset,
+                    demand_reset=demand_reset,
+                    target_var=target_var,
+                    total_target=optimization_total_target,
+                    diversity_mode=diversity_mode,
+                    # Coverage remains primary; travel time now breaks ties and orders equal-coverage plans.
+                    travel_time_matrix=travel_time_matrix,
+                )
 
                 if not plans:
                     st.error("No feasible deployment plan could be generated with the current settings.")
@@ -4403,7 +4087,6 @@ def main():
                 else:
                     sweep_df = None
                     if run_resource_overview:
-                        sweep_started = time.perf_counter()
                         sweep_max = min(int(sweep_max_mhcs), max_facilities)
                         sweep_df = run_resource_sweep(
                             coverage_matrix=coverage_matrix,
@@ -4415,10 +4098,7 @@ def main():
                             total_target=optimization_total_target,
                             max_mhcs=sweep_max,
                             travel_time_matrix=travel_time_matrix,
-                            existing_plan=plans[0],
-                            notices=optimization_notices,
                         )
-                        analysis_timings.append({"Stage": "Fleet scenarios", "Seconds": round(time.perf_counter() - sweep_started, 3)})
 
                     first_plan = plans[0]
                     st.session_state.update({
@@ -4446,8 +4126,6 @@ def main():
                         "previous_covered_dem_ids": previous_covered_dem_ids,
                         "previous_covered_value": previous_covered_value,
                         "remaining_target": optimization_total_target,
-                        "optimization_notices": optimization_notices,
-                        "analysis_timings": analysis_timings,
                     })
 
     has_analysis = st.session_state.analysis_complete and st.session_state.view_mode == "analysis"
@@ -4463,10 +4141,10 @@ def main():
         st.metric("Reachable blocks" if has_analysis else "Blocks to check", f"{len(summary_demand):,}")
         st.metric("MHCs to deploy", f"{int(num_mhcs):,}")
         st.metric("Alternatives requested", f"{int(num_alternative_plans):,}")
-        #if has_analysis:
-            #st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
-        #else:
-            #st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
+        if has_analysis:
+            st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
+        else:
+            st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
 
     if has_analysis:
         plans = st.session_state.get("alternative_plans", [])
@@ -4512,10 +4190,6 @@ def main():
                 if st.session_state.get("prior_deployment_active", False):
                     st.caption("Existing deployment mode: coverage statistics count newly covered demand only; demand already covered by previous deployment locations is excluded.")
                 st.caption("All requested deployment alternatives are shown together on the main screen.")
-
-    if has_analysis:
-        for notice in st.session_state.get("optimization_notices", []):
-            st.warning(notice)
 
     with col_map:
         if st.session_state.view_mode == "analysis" and st.session_state.analysis_complete and plans:
@@ -4818,10 +4492,6 @@ def main():
         has_sweep = sweep_df is not None and isinstance(sweep_df, pd.DataFrame) and not sweep_df.empty
 
         with st.expander("Optional analytics", expanded=False):
-            timing_rows = st.session_state.get("analysis_timings", [])
-            if timing_rows:
-                st.markdown("#### Calculation time")
-                st.dataframe(pd.DataFrame(timing_rows), hide_index=True, use_container_width=True)
             st.markdown("#### Site-level metric definitions")
             st.markdown(f"""
             - **Gross covered {result_target_label}:** demand this site could reach by itself.
@@ -4882,7 +4552,7 @@ def main():
                     ]
                     st.download_button(
                         "Download Best Plan Sites (CSV)",
-                        best_site_df[best_export_cols].assign(**{"Travel-time method": st.session_state.method_used}).to_csv(index=False),
+                        best_site_df[best_export_cols].to_csv(index=False),
                         f"best_plan_{best_plan['plan_rank']}_sites_{selected_zip}.csv",
                         "text/csv",
                         key="best_plan_csv_dl",
@@ -4891,7 +4561,7 @@ def main():
             with c2:
                 st.download_button(
                     "Download All Plan Summary (CSV)",
-                    plan_summary_df.assign(**{"Travel-time method": st.session_state.method_used}).to_csv(index=False),
+                    plan_summary_df.to_csv(index=False),
                     f"deployment_plan_summary_{selected_zip}.csv",
                     "text/csv",
                     key="plan_summary_csv_dl",
@@ -4901,7 +4571,7 @@ def main():
                 all_plan_sites_df = build_all_plan_sites_export(plans, result_target_label)
                 st.download_button(
                     "Download Field Verification CSV",
-                    all_plan_sites_df.assign(**{"Travel-time method": st.session_state.method_used}).to_csv(index=False),
+                    all_plan_sites_df.to_csv(index=False),
                     f"field_verification_plans_{selected_zip}.csv",
                     "text/csv",
                     key="field_verification_csv_dl",
@@ -4909,7 +4579,7 @@ def main():
 
             if not best_site_df.empty:
                 gdf_sel = gpd.GeoDataFrame(
-                    best_site_df.assign(**{"Travel-time method": st.session_state.method_used}),
+                    best_site_df,
                     geometry=gpd.points_from_xy(best_site_df["longitude"], best_site_df["latitude"]),
                     crs="EPSG:4326",
                 )
