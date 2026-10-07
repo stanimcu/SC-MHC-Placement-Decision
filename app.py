@@ -6,7 +6,6 @@ Best combined version composed from the two v9 drafts.
 
 Core changes retained and strengthened
 --------------------------------------
-- Uses travel-time coverage across ZIP boundaries while keeping candidate sites in the selected ZIP.
 - Separates "Number of MHCs to deploy" from "Alternative deployment plans to show".
 - Generates ranked deployment alternatives:
   - 1 MHC: ranks individual candidate sites by coverage.
@@ -64,7 +63,7 @@ from config import JSON_PATH
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v0.4"
+APP_VERSION = "v0.3"
 
 
 # ===========================
@@ -519,8 +518,6 @@ NETWORK_TRAVEL_TIME_WEIGHT = "travel_time_min"
 NETWORK_ACCESS_DIRECTION = "demand_to_site"  # people traveling from census block centroids to the MHC site
 NETWORK_QUERY_BUFFER_M_DRIVE = 5000
 NETWORK_QUERY_BUFFER_M_WALK = 2000
-# Initial search envelope; expand if the downloaded graph contains faster edges.
-NETWORK_SEARCH_SPEED_KMH = 160.0
 MAX_TIEBREAKER_ASSIGNMENT_PAIRS = 60000
 
 COVERAGE_ONLY_DIVERSITY_MODE = "Rank by coverage only"
@@ -779,57 +776,14 @@ def get_ordered_zip_choices(
 
 def get_candidates_in_zip(candidates_df, selected_zip, zip_geom):
     if "zip_join" in candidates_df.columns and candidates_df["zip_join"].notna().any():
-        candidates = candidates_df[candidates_df["zip_join"] == selected_zip].copy()
-    else:
-        candidates = candidates_df[candidates_df.geometry.intersects(zip_geom)].copy()
-    return candidates.drop_duplicates(subset="cand_idx")
+        return candidates_df[candidates_df["zip_join"] == selected_zip].copy()
+    return candidates_df[candidates_df.geometry.intersects(zip_geom)].copy()
 
 
-def travel_search_radius_m(max_time, network_type="drive", use_network=False, search_speed_kmh=None):
-    """Conservative spatial search only; coverage still requires a travel-time check."""
-    if use_network:
-        speed = search_speed_kmh if search_speed_kmh is not None else (
-            NETWORK_SEARCH_SPEED_KMH if network_type == "drive" else WALKING_SPEED_KMH
-        )
-        # Both the block centroid and the site can snap away from their coordinates.
-        allowance = 2.0 * MAX_SNAP_DIST_M
-    else:
-        speed = DEFAULT_DRIVING_SPEED * 1.609344 if network_type == "drive" else WALKING_SPEED_KMH
-        speed /= CIRCUITY_FACTOR
-        allowance = 0.0
-    # Allow for the small difference between spherical and projected distances.
-    return float(speed) * max(float(max_time), 0.0) / 60.0 * 1000.0 * 1.02 + allowance
-
-
-def select_demand_search_area(demand_df, candidates_df, max_time, network_type="drive", use_network=False, search_speed_kmh=None):
-    """Search the full loaded demand dataset around eligible sites, without a ZIP filter."""
-    demand = demand_df.drop_duplicates(subset="dem_idx").copy()
-    lats = pd.to_numeric(demand["latitude"], errors="coerce").to_numpy(dtype=float)
-    lons = pd.to_numeric(demand["longitude"], errors="coerce").to_numpy(dtype=float)
-    valid = np.isfinite(lats) & np.isfinite(lons) & (np.abs(lats) <= 90) & (np.abs(lons) <= 180)
-    keep = np.zeros(len(demand), dtype=bool)
-    radius = travel_search_radius_m(max_time, network_type, use_network, search_speed_kmh)
-    lat2, lon2 = np.radians(lats), np.radians(lons)
-    for _, site in candidates_df.iterrows():
-        lat = pd.to_numeric(site.get("latitude"), errors="coerce")
-        lon = pd.to_numeric(site.get("longitude"), errors="coerce")
-        if not (np.isfinite(lat) and np.isfinite(lon)):
-            continue
-        lat1, lon1 = np.radians(float(lat)), np.radians(float(lon))
-        a = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
-        distance_m = 6371000.0 * 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
-        keep |= valid & (distance_m <= radius)
-    return demand.loc[keep].reset_index(drop=True)
-
-
-def retain_reachable_demand(coverage_matrix, demand_reset, travel_time_matrix):
-    """Use one common demand pool reachable by any eligible candidate, across ZIPs."""
-    reachable = np.asarray(coverage_matrix, dtype=bool).any(axis=0)
-    return (
-        coverage_matrix[:, reachable],
-        demand_reset.loc[reachable].reset_index(drop=True).copy(),
-        travel_time_matrix[:, reachable],
-    )
+def get_demand_in_zip(demand_df, selected_zip, zip_geom):
+    if "zip_join" in demand_df.columns and demand_df["zip_join"].notna().any():
+        return demand_df[demand_df["zip_join"] == selected_zip].copy()
+    return demand_df[demand_df.geometry.intersects(zip_geom)].copy()
 
 
 def build_type_rows_html(types_in_zip, type_colors):
@@ -1068,7 +1022,6 @@ def make_analysis_params(
 
     return {
         "selected_zip": str(selected_zip),
-        "demand_scope": "travel_time_across_zip_boundaries_v1",
         "target_var": str(target_var),
         "selected_types": tuple(sorted(map(str, selected_types))),
         "excluded_cand_ids": tuple(sorted(map(int, excluded_cand_ids))),
@@ -1293,7 +1246,6 @@ def build_deployment_plan(
         "covered_dem_ids": covered_dem_ids,
         "site_metrics_lookup": site_metrics_lookup,
         "coverage_pct": float(coverage_pct),
-        "coverage_total_target": float(total_target),
         "loss_value": float(loss_value),
         "loss_pct_points": float(loss_pct_points),
         "quality_vs_best_pct": float(quality_pct),
@@ -1914,7 +1866,6 @@ def build_plan_summary_df(plans, target_label):
             "Sites in plan": int(len(sel_fac)),
             f"Covered {target_label}": int(round(float(plan["covered_pop"]))),
             "Coverage %": round(float(plan["coverage_pct"]), 2),
-            "Coverage denominator": float(plan["coverage_total_target"]),
             "Avg nearest travel time (min)": round(avg_time, 2) if np.isfinite(avg_time) else np.nan,
             "Loss vs best": int(round(float(plan["loss_value"]))),
             "Site names": site_names,
@@ -2058,8 +2009,6 @@ def build_all_plan_sites_export(plans, target_label):
                 f"marginal_contribution_{target_label}": row.get(f"Marginal contribution {target_label}", 0),
                 "plan_covered_value": int(round(float(plan["covered_pop"]))),
                 "plan_coverage_pct": round(float(plan["coverage_pct"]), 2),
-                "coverage_denominator": float(plan["coverage_total_target"]),
-                "coverage_scope": "Reachable from eligible candidates across ZIP boundaries; previous coverage excluded when enabled",
                 "field_feasibility_status": "",
                 "field_notes": "",
             }
@@ -2873,8 +2822,7 @@ def create_map(
             candidates_in_zip["cand_idx"].astype(int).isin(eligible_ids)
         ].copy()
 
-    # The caller passes the search pool or the routed analysis pool. Do not clip it to the ZIP.
-    map_demand = demand_df.drop_duplicates(subset="dem_idx")
+    demand_in_zip = get_demand_in_zip(demand_df, selected_zip, zip_boundary.geometry)
     types_in_zip = sorted(candidates_in_zip["type"].dropna().unique())
     analysis_complete = selected_cand_ids is not None and covered_dem_ids is not None
     previous_covered_dem_ids = set(previous_covered_dem_ids or [])
@@ -2916,7 +2864,7 @@ def create_map(
 
     # 2. Demand layer. These become the main visual story after analysis.
     if analysis_complete or show_demand_preview:
-        for _, dem in map_demand.iterrows():
+        for _, dem in demand_in_zip.iterrows():
             lat, lon = float(dem["latitude"]), float(dem["longitude"])
             target_val = (
                 float(dem[target_var])
@@ -3050,14 +2998,6 @@ def create_map(
     m.get_root().html.add_child(folium.Element(legend_html))
 
     minx, miny, maxx, maxy = map(float, bounds)
-    if (analysis_complete or show_demand_preview) and not map_demand.empty:
-        minx = min(minx, float(map_demand["longitude"].min()))
-        miny = min(miny, float(map_demand["latitude"].min()))
-        maxx = max(maxx, float(map_demand["longitude"].max()))
-        maxy = max(maxy, float(map_demand["latitude"].max()))
-    for loc in previous_deployment_locations:
-        lat, lon = float(loc["latitude"]), float(loc["longitude"])
-        minx, miny, maxx, maxy = min(minx, lon), min(miny, lat), max(maxx, lon), max(maxy, lat)
     pad_x = min(max((maxx - minx) * 0.08, 0.0015), 0.25)
     pad_y = min(max((maxy - miny) * 0.08, 0.0015), 0.25)
     m.fit_bounds([[miny - pad_y, minx - pad_x], [maxy + pad_y, maxx + pad_x]])
@@ -3285,45 +3225,12 @@ def build_network_query_polygon(zip_geom, candidates_df, demand_df, buffer_m):
     return zip_geom
 
 
-def load_travel_time_graph(zip_geom, sites_df, max_time, network_type):
-    """Download enough network around all sites for the time limit, across ZIPs."""
-    speed_bound = NETWORK_SEARCH_SPEED_KMH if network_type == "drive" else WALKING_SPEED_KMH
-    extra_buffer = NETWORK_QUERY_BUFFER_M_DRIVE if network_type == "drive" else NETWORK_QUERY_BUFFER_M_WALK
-    for _ in range(3):
-        radius = travel_search_radius_m(max_time, network_type, True, speed_bound) + extra_buffer
-        polygon = build_network_query_polygon(None, sites_df, None, radius)
-        try:
-            if polygon is None or polygon.is_empty:
-                raise ValueError("Network query polygon could not be created.")
-            graph = get_osm_graph_for_polygon(polygon.wkt, network_type)
-        except Exception:
-            center = zip_geom.centroid
-            distance = estimate_required_graph_dist_m(
-                center.y, center.x, sites_df, None, min_dist=15000, buffer_m=radius
-            )
-            graph = get_osm_graph(center.y, center.x, int(distance), network_type)
-
-        observed_speed = 0.0
-        for _, _, data in graph.edges(data=True):
-            length_m = float(data.get("length", 0.0) or 0.0)
-            minutes = float(data.get(NETWORK_TRAVEL_TIME_WEIGHT, np.nan))
-            if length_m > 0 and (not np.isfinite(minutes) or minutes <= 0):
-                raise ValueError("The road network contains an invalid travel-time weight.")
-            if length_m > 0:
-                observed_speed = max(observed_speed, length_m / minutes * 0.06)
-        if observed_speed <= speed_bound:
-            return graph, speed_bound
-        # Rebuild both the network and the demand envelope if faster roads are present.
-        speed_bound = observed_speed * 1.05
-    raise ValueError("Could not establish a sufficient road-network search extent.")
-
-
 def local_projected_xy(lons, lats):
     """Project lon/lat arrays to a local CRS and return x/y in meters."""
     lons = np.asarray(lons, dtype=float)
     lats = np.asarray(lats, dtype=float)
+    gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(lons, lats), crs="EPSG:4326")
     try:
-        gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(lons, lats), crs="EPSG:4326")
         local_crs = gdf.estimate_utm_crs()
         if local_crs is None:
             raise ValueError("Could not estimate local CRS.")
@@ -3468,14 +3375,6 @@ def main():
             plans default to a site-distinct setting so alternatives do not simply
             repeat most of the same locations.
 
-            **Study area:** The selected ZIP limits candidate sites. Demand includes
-            all loaded census block centroids reachable within the selected travel
-            time, including blocks in other ZIPs and counties. Coverage percentages
-            use the demand reachable by at least one eligible candidate site. In
-            existing-deployment mode, previously covered demand is removed from that
-            denominator. Changing candidate filters or travel time can change the
-            denominator. Coverage is based on block centroids, not block boundaries.
-
             **Existing deployment option:** If this is not the first deployment, add
             one or more previous deployment locations in Advanced settings. The new
             run focuses on areas not already reached by those locations.
@@ -3610,6 +3509,7 @@ def main():
 
         zip_geom = zip_gdf[zip_gdf["ZIP_CODE"] == selected_zip].iloc[0].geometry
         candidates_zip_all = get_candidates_in_zip(candidates_df, selected_zip, zip_geom)
+        demand_in_zip = get_demand_in_zip(demand_df, selected_zip, zip_geom)
 
         with st.expander("⚙️ Model Constraints", expanded=True):
             available_site_types = sorted(candidates_zip_all["type"].dropna().unique())
@@ -3883,8 +3783,7 @@ def main():
                     value=default_time,
                 )
 
-            #st.caption(f"{max_facilities:,} candidate sites remain after filters/exclusions.")
-            #st.caption("Candidate sites stay in the selected ZIP. Demand coverage follows travel time across ZIP boundaries, using blocks available in the loaded dataset.")
+            st.caption(f"{max_facilities:,} candidate sites remain after filters/exclusions.")
 
     if st.session_state.prev_county != selected_county_fips:
         st.session_state.view_mode = "county" if selected_county_fips is not None else "zip"
@@ -3941,11 +3840,12 @@ def main():
         st.info("Controls changed since the last calculation, so previous results were cleared. Click Calculate Optimal Sites to refresh.")
 
     if run_analysis:
-        reset_analysis_state()
         st.session_state.view_mode = "analysis"
 
-    demand_search = select_demand_search_area(
-        demand_df, candidates_in_zip, time_threshold, travel_mode, use_network
+    total_target = (
+        float(demand_in_zip[target_var].sum())
+        if len(demand_in_zip) and target_var in demand_in_zip.columns
+        else 0.0
     )
 
     result_title = build_result_title(
@@ -3963,6 +3863,20 @@ def main():
 
     primary_plan = None
 
+    with col_insights:
+        st.subheader("📊 Summary Statistics")
+        if st.session_state.view_mode == "county" and selected_county_fips is not None:
+            st.metric("County", selected_county_name)
+        else:
+            st.metric("ZIP Code", selected_zip_display)
+        st.metric(f"Total {target_label}", f"{int(round(total_target)):,}")
+        if not is_first_deployment:
+            st.metric("Deployment mode", "Existing deployment")
+        st.metric("Available Candidate Sites", f"{len(candidates_in_zip):,}")
+        st.metric("Demand Points", f"{len(demand_in_zip):,}")
+        st.metric("MHCs to deploy", f"{int(num_mhcs):,}")
+        st.metric("Alternatives requested", f"{int(num_alternative_plans):,}")
+
     if run_analysis:
         if max_facilities == 0:
             st.error("No candidate facilities available. Change ZIP, site types, or exclusions.")
@@ -3977,33 +3891,55 @@ def main():
                 previous_deployment_locations = previous_deployment_records_from_df(previous_deployment_df)
 
                 if use_network:
+                    zip_center = zip_geom.centroid
+                    net_type = "drive" if travel_mode == "drive" else "walk"
                     try:
                         network_extent_candidates = candidates_in_zip
                         if previous_deployment_df is not None and not previous_deployment_df.empty:
                             network_extent_candidates = pd.concat(
-                                [candidates_in_zip, previous_deployment_df], ignore_index=True, sort=False
+                                [candidates_in_zip, previous_deployment_df],
+                                ignore_index=True,
+                                sort=False,
                             )
-                        with st.spinner("Loading roads within the travel-time search area..."):
-                            G, search_speed = load_travel_time_graph(
-                                zip_geom, network_extent_candidates, time_threshold, travel_mode
-                            )
-                        demand_search = select_demand_search_area(
-                            demand_df, candidates_in_zip, time_threshold, travel_mode, True, search_speed
+
+                        buffer_m = (
+                            NETWORK_QUERY_BUFFER_M_DRIVE
+                            if travel_mode == "drive"
+                            else NETWORK_QUERY_BUFFER_M_WALK
                         )
+                        query_polygon = build_network_query_polygon(
+                            zip_geom=zip_geom,
+                            candidates_df=network_extent_candidates,
+                            demand_df=demand_in_zip,
+                            buffer_m=buffer_m,
+                        )
+
+                        with st.spinner("Loading road network..."):
+                            try:
+                                if query_polygon is None or query_polygon.is_empty:
+                                    raise ValueError("Network query polygon could not be created.")
+                                G = get_osm_graph_for_polygon(query_polygon.wkt, net_type)
+                            except Exception:
+                                graph_dist_m = estimate_required_graph_dist_m(
+                                    zip_center.y,
+                                    zip_center.x,
+                                    network_extent_candidates,
+                                    demand_in_zip,
+                                    min_dist=15000,
+                                    buffer_m=buffer_m,
+                                )
+                                G = get_osm_graph(zip_center.y, zip_center.x, int(graph_dist_m), net_type)
+
                         method_used = "Road Network (OSM, demand-to-site free-flow travel time)"
                     except Exception as e:
-                        G = None
                         st.warning(
                             "Road network failed, so the app is using Manhattan-style distance instead. "
                             f"Details: {e}"
                         )
-                        demand_search = select_demand_search_area(
-                            demand_df, candidates_in_zip, time_threshold, travel_mode, False
-                        )
 
                 raw_coverage_matrix, candidates_reset, demand_reset, travel_time_matrix = build_coverage_matrix(
                     candidates_in_zip,
-                    demand_search,
+                    demand_in_zip,
                     time_threshold,
                     network_type=travel_mode,
                     use_network=use_network,
@@ -4021,14 +3957,6 @@ def main():
                         "Road-network routing produced no routable candidate-to-demand pairs. "
                         "Check coordinates, OSM road coverage, and the snap-distance threshold."
                     )
-
-                raw_coverage_matrix, demand_reset, travel_time_matrix = retain_reachable_demand(
-                    raw_coverage_matrix, demand_reset, travel_time_matrix
-                )
-                if demand_reset.empty:
-                    st.session_state.view_mode = "zip"
-                    st.warning("No loaded census block centroids are reachable from the eligible sites within this travel time. Increase the time limit or change the candidate sites.")
-                    st.stop()
 
                 raw_demand_weights = pd.to_numeric(
                     demand_reset[target_var],
@@ -4128,25 +4056,7 @@ def main():
                         "remaining_target": optimization_total_target,
                     })
 
-    has_analysis = st.session_state.analysis_complete and st.session_state.view_mode == "analysis"
-    summary_demand = st.session_state.demand_reset if has_analysis else demand_search
-    summary_total = float(pd.to_numeric(summary_demand[target_var], errors="coerce").fillna(0).clip(lower=0).sum())
-    with col_insights:
-        st.subheader("📊 Summary Statistics")
-        st.metric("Candidate ZIP", selected_zip_display)
-        st.metric(f"{'Reachable' if has_analysis else 'Search-area'} {target_label}", f"{int(round(summary_total)):,}")
-        if not is_first_deployment:
-            st.metric("Deployment mode", "Existing deployment")
-        st.metric("Available Candidate Sites", f"{len(candidates_in_zip):,}")
-        st.metric("Reachable blocks" if has_analysis else "Blocks to check", f"{len(summary_demand):,}")
-        st.metric("MHCs to deploy", f"{int(num_mhcs):,}")
-        st.metric("Alternatives requested", f"{int(num_alternative_plans):,}")
-        #if has_analysis:
-            #st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
-        #else:
-            #st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
-
-    if has_analysis:
+    if st.session_state.analysis_complete and st.session_state.view_mode == "analysis":
         plans = st.session_state.get("alternative_plans", [])
         if plans:
             # Plan 1 remains the primary/best plan for backward-compatible exports,
@@ -4261,7 +4171,7 @@ def main():
                                 zip_gdf=zip_gdf,
                                 selected_zip=selected_zip,
                                 candidates_df=candidates_df,
-                                demand_df=st.session_state.demand_reset,
+                                demand_df=demand_df,
                                 type_colors=global_type_colors,
                                 target_var=st.session_state.target_variable,
                                 target_label=result_target_label,
@@ -4313,7 +4223,7 @@ def main():
                 zip_gdf=zip_gdf,
                 selected_zip=selected_zip,
                 candidates_df=candidates_df,
-                demand_df=demand_search,
+                demand_df=demand_df,
                 type_colors=global_type_colors,
                 target_var=target_var,
                 target_label=target_label,
@@ -4594,3 +4504,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
