@@ -71,12 +71,31 @@ from config import JSON_PATH, MAX_OPTIMIZATION_TIME
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v0.6 — reviewed coverage and faster repeated runs"
+APP_VERSION = "v0.6.2 — automatic Manhattan fallback when road routing fails"
 
 
 # ===========================
 # OSMNX CACHE CONFIGURATION
 # ===========================
+def configure_osmnx_request_limits():
+    """Reduce per-request work without reducing the full road-network extent.
+
+    The HTTP timeout is deliberately longer than the server query timeout so
+    the server can finish processing and transmit its response. Requests still
+    run sequentially under OSMnx's normal rate-limit/slot handling.
+    """
+    ox.settings.requests_timeout = 300
+    current = getattr(ox.settings, "overpass_settings", "[out:json][timeout:{timeout}]{maxsize}")
+    # Preserve any other custom query settings, e.g. a historical snapshot date.
+    if re.search(r"\[timeout:[^\]]+\]", current):
+        current = re.sub(r"\[timeout:[^\]]+\]", "[timeout:180]", current)
+    else:
+        current += "[timeout:180]"
+    ox.settings.overpass_settings = current
+    current_area = float(getattr(ox.settings, "max_query_area_size", 2_500_000_000))
+    ox.settings.max_query_area_size = min(current_area, 500_000_000)
+
+
 def configure_osmnx_cache():
     """
     Configure OSMnx to use a writable absolute cache directory.
@@ -87,6 +106,7 @@ def configure_osmnx_cache():
     function moves the cache to a user/temp-local folder and falls back to no
     disk cache if no writable folder is available.
     """
+    configure_osmnx_request_limits()
     candidate_dirs = []
 
     custom_dir = os.environ.get("MHC_OSMNX_CACHE_DIR")
@@ -121,13 +141,11 @@ def configure_osmnx_cache():
             # Forward slashes are accepted by Windows and avoid fragile escaped
             # backslash display such as cache\b....json in error messages.
             ox.settings.cache_folder = cache_dir.as_posix()
-            ox.settings.requests_timeout = 180
             return cache_dir
         except Exception:
             continue
 
     ox.settings.use_cache = False
-    ox.settings.requests_timeout = 180
     return None
 
 
@@ -531,6 +549,7 @@ OVERPASS_URLS = (
     "https://overpass-api.de/api",
 )
 GRAPH_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+NETWORK_FALLBACK_CACHE_TTL_SECONDS = 10 * 60
 MAX_TIEBREAKER_ASSIGNMENT_PAIRS = 60000
 
 COVERAGE_ONLY_DIVERSITY_MODE = "Rank by coverage only"
@@ -3159,13 +3178,19 @@ def snap_points_to_nodes(G, lons, lats, max_snap_dist_m=MAX_SNAP_DIST_M):
         nodes[dists > max_snap_dist_m] = None
         out[:] = nodes
         return out
-    except Exception:
+    except Exception as bulk_error:
+        failed_points = 0
         for i, (lo, la) in enumerate(zip(lons, lats)):
             try:
                 n, d = ox.distance.nearest_nodes(G, lo, la, return_dist=True)
                 out[i] = n if d <= max_snap_dist_m else None
             except Exception:
                 out[i] = None
+                failed_points += 1
+        if failed_points:
+            raise RuntimeError(
+                "Road-node lookup failed; incomplete road coverage was discarded."
+            ) from bulk_error
         return out
 
 
@@ -3351,17 +3376,22 @@ def download_osm_graph_with_recovery(download_func, query_key):
         failures = []
         last_error = None
         try:
-            ox.settings.http_user_agent = "SC-MHC-Placement-Decision/0.5 (OSMnx)"
+            ox.settings.http_user_agent = "SC-MHC-Placement-Decision/0.6.1 (OSMnx)"
             for endpoint in get_overpass_urls():
                 for name in endpoint_settings:
                     setattr(ox.settings, name, endpoint)
+                attempt_started = time.perf_counter()
                 try:
                     graph = _download_osm_graph_with_cache_fallback(download_func)
                 except (RequestsConnectionError, RequestsTimeout) as exc:
                     host = urlsplit(endpoint).hostname
-                    failures.append(f"{host}: {type(exc).__name__}")
+                    elapsed = time.perf_counter() - attempt_started
+                    failures.append(f"{host}: {type(exc).__name__} after {elapsed:.0f}s")
                     last_error = exc
-                    logging.getLogger(__name__).warning("Road-network connection failed at %s (%s).", host, type(exc).__name__)
+                    logging.getLogger(__name__).warning(
+                        "Road-data request failed at %s after %.1fs (%s). Full underlying error follows.",
+                        host, elapsed, type(exc).__name__, exc_info=True,
+                    )
                     continue
 
                 # Save raw graph data; each caller reapplies the app's speed model.
@@ -3388,7 +3418,7 @@ def download_osm_graph_with_recovery(download_func, query_key):
                 elif hasattr(ox.settings, name):
                     delattr(ox.settings, name)
         raise RoadNetworkUnavailable(
-            "Could not connect to the road-data providers. " + "; ".join(failures)
+            "Road data could not be retrieved from the configured providers. " + "; ".join(failures)
         ) from last_error
 
 
@@ -3640,22 +3670,16 @@ def make_routing_key(data_signature, selected_zip, candidates, previous_sites, m
             return []
         columns = [col for col in ("cand_idx", "latitude", "longitude") if col in df.columns]
         return df[columns].to_json(orient="split", index=False, double_precision=15)
-    payload = ["routing-v06", data_signature, str(selected_zip), points(candidates), points(previous_sites),
+    payload = ["routing-v062-auto-fallback", data_signature, str(selected_zip), points(candidates), points(previous_sites),
                float(max_time), str(mode), bool(use_network)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def prepare_routing_data(candidates, demand, previous_sites, zip_geom, max_time, mode, use_network, spatial_index):
-    """Compute target-independent routing once, including previous-deployment overlap."""
-    graph = None
-    search_speed = None
-    method = "Manhattan-style Distance"
-    if use_network:
-        extent_sites = candidates
-        if previous_sites is not None and not previous_sites.empty:
-            extent_sites = pd.concat([candidates, previous_sites], ignore_index=True, sort=False)
-        graph, search_speed = load_travel_time_graph(zip_geom, extent_sites, max_time, mode)
-        method = "Road Network (OSM, demand-to-site free-flow travel time)"
+def calculate_routing_for_method(candidates, demand, previous_sites, max_time, mode,
+                                 use_network, spatial_index, graph=None, search_speed=None):
+    """Build a complete, consistent routing result using exactly one method."""
+    if use_network and graph is None:
+        raise RuntimeError("Road routing did not produce a usable graph.")
     search = select_demand_search_area(
         demand, candidates, max_time, mode, use_network, search_speed, spatial_index
     )
@@ -3673,9 +3697,60 @@ def prepare_routing_data(candidates, demand, previous_sites, zip_geom, max_time,
         previous_mask = previous_coverage.astype(bool).any(axis=0)
     return {
         "coverage": coverage, "candidates": candidate_rows, "demand": demand_rows,
-        "times": times, "previous_mask": previous_mask, "method": method,
+        "times": times, "previous_mask": previous_mask,
+        "method": ("Road Network (OSM, demand-to-site free-flow travel time)" if use_network
+                   else "Manhattan-style Distance (estimated travel times)"),
+        "used_network": bool(use_network), "fallback_used": False,
         "created_at": time.time(),
     }
+
+
+def prepare_routing_data(candidates, demand, previous_sites, zip_geom, max_time, mode, use_network, spatial_index):
+    """Try roads, then rebuild the entire analysis with Manhattan on road failure.
+
+    Includes graph download/preparation, current sites, and previous deployment
+    routing. Partial road results are discarded, so no plan mixes the methods.
+    """
+    fallback_used = False
+    if use_network:
+        try:
+            extent_sites = candidates
+            if previous_sites is not None and not previous_sites.empty:
+                extent_sites = pd.concat([candidates, previous_sites], ignore_index=True, sort=False)
+            graph, search_speed = load_travel_time_graph(zip_geom, extent_sites, max_time, mode)
+            return calculate_routing_for_method(
+                candidates, demand, previous_sites, max_time, mode, True, spatial_index,
+                graph=graph, search_speed=search_speed,
+            )
+        except Exception:
+            # Only this road-routing pipeline is caught; solver/data errors are
+            # still surfaced by their normal checks. Release local graph refs.
+            graph = None
+            logging.getLogger(__name__).warning(
+                "Road routing failed. Recomputing all travel times and previous-deployment "
+                "coverage using Manhattan-style estimates.", exc_info=True,
+            )
+            fallback_used = True
+
+    result = calculate_routing_for_method(
+        candidates, demand, previous_sites, max_time, mode, False, spatial_index,
+    )
+    if fallback_used:
+        result["fallback_used"] = True
+        result["method"] = "Manhattan-style Distance (automatic fallback; estimated travel times)"
+    return result
+
+
+def routing_data_is_reusable(cached_routing, routing_key, now=None):
+    """Reuse fallback briefly; retry roads on a later Calculate after recovery."""
+    if not cached_routing or cached_routing.get("key") != routing_key:
+        return False
+    data = cached_routing.get("data", {})
+    if "created_at" not in data:
+        return False
+    ttl = NETWORK_FALLBACK_CACHE_TTL_SECONDS if data.get("fallback_used", False) else GRAPH_CACHE_TTL_SECONDS
+    age = (time.time() if now is None else float(now)) - data["created_at"]
+    return 0 <= age < ttl
 
 
 # ===========================
@@ -3746,9 +3821,11 @@ def main():
             not a turn-specific or live-traffic model. Capacity, queues, and clinic
             operating hours are not modeled: coverage means potential geographic access.
 
-            **Manhattan-style Distance (when road routing is off):** Projected rectilinear distance
+            **Manhattan-style Distance (when road routing is off or fails):** Projected rectilinear distance
             x 1.2 circuity factor, converted to travel time. This is a fast
-            approximation, not a replacement for road-network routing.
+            approximation. If road downloads or routing fail, the full calculation,
+            including previous-deployment coverage, is rebuilt with this method.
+            The displayed method and exports identify automatic fallback results.
         """)
 
     st.divider()
@@ -4226,10 +4303,7 @@ def main():
                     time_threshold, travel_mode, use_network,
                 )
                 cached_routing = st.session_state.get("last_routing_data")
-                routing_reused = bool(
-                    cached_routing and cached_routing["key"] == routing_key
-                    and time.time() - cached_routing["data"]["created_at"] < GRAPH_CACHE_TTL_SECONDS
-                )
+                routing_reused = routing_data_is_reusable(cached_routing, routing_key)
                 try:
                     if routing_reused:
                         routed = cached_routing["data"]
@@ -4244,8 +4318,8 @@ def main():
                     st.session_state.view_mode = "zip"
                     st.error(
                         "Travel-time calculation failed. No deployment plan was calculated. "
-                        "For a road-data connection error, try again later, or turn off road routing "
-                        "if you want estimated travel times. "
+                        "Road-routing failures automatically fall back to Manhattan estimates; "
+                        "the calculation could not finish with the available data. "
                         f"Details: {exc}"
                     )
                     st.stop()
@@ -4283,7 +4357,7 @@ def main():
                         previous_deployment_df=previous_deployment_df,
                         time_threshold=time_threshold,
                         travel_mode=travel_mode,
-                        use_network=use_network,
+                        use_network=routed["used_network"],
                         G=None,
                         network_access_direction=NETWORK_ACCESS_DIRECTION,
                         previous_covered_mask=routed["previous_mask"],
@@ -4808,7 +4882,7 @@ def main():
                     ]
                     st.download_button(
                         "Download Best Plan Sites (CSV)",
-                        best_site_df[best_export_cols].to_csv(index=False),
+                        best_site_df[best_export_cols].assign(**{"Travel-time method": st.session_state.method_used}).to_csv(index=False),
                         f"best_plan_{best_plan['plan_rank']}_sites_{selected_zip}.csv",
                         "text/csv",
                         key="best_plan_csv_dl",
@@ -4817,7 +4891,7 @@ def main():
             with c2:
                 st.download_button(
                     "Download All Plan Summary (CSV)",
-                    plan_summary_df.to_csv(index=False),
+                    plan_summary_df.assign(**{"Travel-time method": st.session_state.method_used}).to_csv(index=False),
                     f"deployment_plan_summary_{selected_zip}.csv",
                     "text/csv",
                     key="plan_summary_csv_dl",
@@ -4827,7 +4901,7 @@ def main():
                 all_plan_sites_df = build_all_plan_sites_export(plans, result_target_label)
                 st.download_button(
                     "Download Field Verification CSV",
-                    all_plan_sites_df.to_csv(index=False),
+                    all_plan_sites_df.assign(**{"Travel-time method": st.session_state.method_used}).to_csv(index=False),
                     f"field_verification_plans_{selected_zip}.csv",
                     "text/csv",
                     key="field_verification_csv_dl",
@@ -4835,7 +4909,7 @@ def main():
 
             if not best_site_df.empty:
                 gdf_sel = gpd.GeoDataFrame(
-                    best_site_df,
+                    best_site_df.assign(**{"Travel-time method": st.session_state.method_used}),
                     geometry=gpd.points_from_xy(best_site_df["longitude"], best_site_df["latitude"]),
                     crs="EPSG:4326",
                 )
