@@ -3883,8 +3883,8 @@ def main():
                     value=default_time,
                 )
 
-            st.caption(f"{max_facilities:,} candidate sites remain after filters/exclusions.")
-            st.caption("Candidate sites stay in the selected ZIP. Demand coverage follows travel time across ZIP boundaries, using blocks available in the loaded dataset.")
+            #st.caption(f"{max_facilities:,} candidate sites remain after filters/exclusions.")
+            #st.caption("Candidate sites stay in the selected ZIP. Demand coverage follows travel time across ZIP boundaries, using blocks available in the loaded dataset.")
 
     if st.session_state.prev_county != selected_county_fips:
         st.session_state.view_mode = "county" if selected_county_fips is not None else "zip"
@@ -4141,10 +4141,10 @@ def main():
         st.metric("Reachable blocks" if has_analysis else "Blocks to check", f"{len(summary_demand):,}")
         st.metric("MHCs to deploy", f"{int(num_mhcs):,}")
         st.metric("Alternatives requested", f"{int(num_alternative_plans):,}")
-        if has_analysis:
-            st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
-        else:
-            st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
+        #if has_analysis:
+            #st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
+        #else:
+            #st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
 
     if has_analysis:
         plans = st.session_state.get("alternative_plans", [])
