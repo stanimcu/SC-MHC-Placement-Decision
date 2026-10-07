@@ -4463,10 +4463,10 @@ def main():
         st.metric("Reachable blocks" if has_analysis else "Blocks to check", f"{len(summary_demand):,}")
         st.metric("MHCs to deploy", f"{int(num_mhcs):,}")
         st.metric("Alternatives requested", f"{int(num_alternative_plans):,}")
-        if has_analysis:
-            st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
-        else:
-            st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
+        #if has_analysis:
+            #st.caption("Coverage uses blocks reachable by at least one eligible candidate site, including blocks outside the selected ZIP. Previously covered demand is excluded in existing-deployment mode.")
+        #else:
+            #st.caption("The search area includes nearby blocks across ZIP boundaries. Calculate to identify which blocks meet the travel-time limit.")
 
     if has_analysis:
         plans = st.session_state.get("alternative_plans", [])
