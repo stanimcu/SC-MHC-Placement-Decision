@@ -71,7 +71,7 @@ from config import JSON_PATH, MAX_OPTIMIZATION_TIME
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v0.6.2 — automatic Manhattan fallback when road routing fails"
+APP_VERSION = "v0.6.2"
 
 
 # ===========================
