@@ -24,15 +24,20 @@ Core changes retained and strengthened
   status fields when present.
 - Adds exports for the best plan, all plans, GeoJSON, and field-verification workflow.
 - Resets stale analysis when model-defining controls change.
+- Road-network downloads identify the app to Overpass, fail over across public
+  Overpass servers, use a tighter search extent, and are cached on disk so
+  repeat runs for the same area do not contact any server.
 
 Author: Tanim
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
+import pickle
 import re
 import tempfile
 import warnings
@@ -45,6 +50,7 @@ import networkx as nx
 import numpy as np
 import osmnx as ox
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from pulp import LpMaximize, LpMinimize, LpProblem, LpStatus, LpVariable, lpSum, value
@@ -57,7 +63,7 @@ try:
 except Exception:  # PuLP 4 removes the legacy bundled CBC solver name
     PULP_CBC_CMD = None
 from shapely import wkt
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, box
 from streamlit_folium import st_folium
 
 from config import JSON_PATH
@@ -125,6 +131,57 @@ def configure_osmnx_cache():
 
 
 OSMNX_CACHE_DIR = configure_osmnx_cache()
+
+
+# ===========================
+# OVERPASS SERVER CONFIGURATION
+# ===========================
+# Since April 2026 the main public Overpass server (overpass-api.de) blocks heavy
+# users and scripts that send a generic user agent. OSMnx's default user agent is
+# shared by every OSMnx user, so this app identifies itself explicitly and fails
+# over to other public Overpass servers when one refuses the connection.
+#
+# Optional environment variables:
+#   MHC_OVERPASS_CONTACT  email or project URL added to the user agent, so server
+#                         operators can contact you instead of blocking you.
+#   MHC_OVERPASS_URLS     comma-separated Overpass base URLs to try first,
+#                         e.g. a university or self-hosted instance.
+#   MHC_GRAPH_CACHE_DIR   folder for cached road networks (default: next to the
+#                         OSMnx cache folder).
+OVERPASS_CONTACT = os.environ.get("MHC_OVERPASS_CONTACT", "").strip()
+OVERPASS_USER_AGENT = (
+    f"SC-MHC-Placement-Tool/{APP_VERSION} (academic health-access research"
+    + (f"; contact: {OVERPASS_CONTACT}" if OVERPASS_CONTACT else "")
+    + ")"
+)
+OVERPASS_REFERER = OVERPASS_USER_AGENT
+DEFAULT_OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api",
+    "https://maps.mail.ru/osm/tools/overpass/api",
+    "https://overpass.private.coffee/api",
+    "https://overpass.kumi.systems/api",
+)
+# (connect, read) seconds for the quick status check before a download.
+OVERPASS_PROBE_TIMEOUT = (5, 10)
+# Bump to invalidate cached road networks after changing how graphs are built.
+GRAPH_CACHE_FORMAT_VERSION = 1
+
+
+class OverpassUnavailableError(RuntimeError):
+    """Raised when no Overpass server could serve a road-network download."""
+
+
+def configure_overpass_identity():
+    """Send an identifying user agent and referer with every OSMnx request."""
+    for name in ("http_user_agent", "default_user_agent"):  # OSMnx 2.x, 1.x
+        if hasattr(ox.settings, name):
+            setattr(ox.settings, name, OVERPASS_USER_AGENT)
+    for name in ("http_referer", "default_referer"):
+        if hasattr(ox.settings, name):
+            setattr(ox.settings, name, OVERPASS_REFERER)
+
+
+configure_overpass_identity()
 
 # ===========================
 # PAGE CONFIG
@@ -517,10 +574,15 @@ DEFAULT_DRIVING_SPEED = 25
 MAX_SNAP_DIST_M = 2000
 NETWORK_TRAVEL_TIME_WEIGHT = "travel_time_min"
 NETWORK_ACCESS_DIRECTION = "demand_to_site"  # people traveling from census block centroids to the MHC site
-NETWORK_QUERY_BUFFER_M_DRIVE = 5000
+# The search radius already adds 2 x MAX_SNAP_DIST_M for snapping; one more
+# MAX_SNAP_DIST_M keeps nearest-node snapping exact at the edge of the area.
+NETWORK_QUERY_BUFFER_M_DRIVE = 2000
 NETWORK_QUERY_BUFFER_M_WALK = 2000
-# Initial search envelope; expand if the downloaded graph contains faster edges.
-NETWORK_SEARCH_SPEED_KMH = 160.0
+# Initial search envelope. South Carolina's highest posted limit is 70 mph
+# (about 113 km/h). load_travel_time_graph() checks every downloaded edge and
+# widens the area if anything is faster, so results stay exact. The previous
+# value (160 km/h) roughly doubled the download area at 20 minutes.
+NETWORK_SEARCH_SPEED_KMH = 115.0
 MAX_TIEBREAKER_ASSIGNMENT_PAIRS = 60000
 
 COVERAGE_ONLY_DIVERSITY_MODE = "Rank by coverage only"
@@ -3189,8 +3251,8 @@ def preprocess_network_speeds(G, network_type="drive"):
     return G
 
 
-def _download_osm_graph_with_cache_fallback(download_func):
-    configure_osmnx_cache()
+def _run_with_osmnx_cache_fallback(download_func):
+    """Run an OSMnx download, retrying without the HTTP cache on cache errors."""
     try:
         return download_func()
     except Exception as exc:
@@ -3205,8 +3267,272 @@ def _download_osm_graph_with_cache_fallback(download_func):
 
 
 @st.cache_resource(show_spinner=False)
+def _overpass_state():
+    """Process-wide memory of the last Overpass server that worked."""
+    return {"last_good": None}
+
+
+def get_overpass_endpoints(last_good=None):
+    """Overpass base URLs to try, in order: env override, last good, defaults."""
+    custom = [
+        u.strip()
+        for u in os.environ.get("MHC_OVERPASS_URLS", "").split(",")
+        if u.strip()
+    ]
+    ordered = custom + ([last_good] if last_good else []) + list(DEFAULT_OVERPASS_ENDPOINTS)
+    endpoints = []
+    for url in ordered:
+        url = url.rstrip("/")
+        if url.endswith("/interpreter"):
+            url = url[: -len("/interpreter")]
+        if url and url not in endpoints:
+            endpoints.append(url)
+    return endpoints
+
+
+def _overpass_host(url):
+    return url.split("://", 1)[-1].split("/", 1)[0]
+
+
+def _short_error(exc):
+    text = str(exc)
+    lowered = text.lower()
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return "blocked by network proxy"
+    if "connection refused" in lowered:
+        return "connection refused"
+    if isinstance(exc, requests.exceptions.Timeout) or "timed out" in lowered:
+        return "timed out"
+    if "name or service not known" in lowered or "getaddrinfo failed" in lowered:
+        return "DNS lookup failed"
+    text = " ".join(text.split())
+    return f"{type(exc).__name__}: {text[:140]}"
+
+
+def _status_page_is_parseable(text):
+    """Mirror OSMnx's own parse of /status, which otherwise waits 60 s on failure."""
+    try:
+        first_token = str(text).split("\n")[4].split(" ")[0]
+    except (AttributeError, IndexError):
+        return False
+    return first_token.isdigit() or first_token == "Slot"
+
+
+def probe_overpass_endpoint(url):
+    """
+    Quick check before sending a large query.
+
+    Returns (usable, status_page_ok, detail). A server that refuses the
+    connection, times out, or answers the status page with a block/overload
+    code is skipped. A reachable server whose status page cannot be parsed is
+    still used, but with OSMnx's slot check turned off so it does not sleep 60 s.
+    """
+    try:
+        response = requests.get(
+            url.rstrip("/") + "/status",
+            headers={"User-Agent": OVERPASS_USER_AGENT, "Referer": OVERPASS_REFERER},
+            timeout=OVERPASS_PROBE_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, False, _short_error(exc)
+
+    code = int(response.status_code)
+    if code in (403, 406, 429) or code >= 500:
+        return False, False, f"HTTP {code}"
+    if code == 200 and _status_page_is_parseable(response.text):
+        return True, True, "ok"
+    return True, False, f"status page HTTP {code}"
+
+
+def _apply_overpass_endpoint(url, use_rate_limit):
+    if hasattr(ox.settings, "overpass_url"):  # OSMnx 2.x
+        ox.settings.overpass_url = url
+    if hasattr(ox.settings, "overpass_endpoint"):  # OSMnx 1.x
+        ox.settings.overpass_endpoint = url
+    ox.settings.overpass_rate_limit = bool(use_rate_limit)
+
+
+def _is_overpass_service_error(exc):
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    return type(exc).__name__ in {
+        "InsufficientResponseError",
+        "ResponseStatusCodeError",
+        "EmptyOverpassResponse",
+    }
+
+
+def _download_osm_graph_with_cache_fallback(download_func):
+    """
+    Download an OSMnx graph, failing over across Overpass servers.
+
+    Each server gets a quick status probe first, so a refused or blocked server
+    costs a second instead of OSMnx's 60-second pause plus a failed request.
+    Raises OverpassUnavailableError when no server can serve the request.
+    """
+    configure_osmnx_cache()
+    configure_overpass_identity()
+    state = _overpass_state()
+    attempts = []
+
+    for url in get_overpass_endpoints(state.get("last_good")):
+        host = _overpass_host(url)
+        usable, status_ok, detail = probe_overpass_endpoint(url)
+        if not usable:
+            attempts.append(f"{host}: {detail}")
+            continue
+
+        _apply_overpass_endpoint(url, use_rate_limit=status_ok)
+        try:
+            graph = _run_with_osmnx_cache_fallback(download_func)
+        except Exception as exc:
+            if not _is_overpass_service_error(exc):
+                raise
+            attempts.append(f"{host}: {_short_error(exc)}")
+            continue
+
+        state["last_good"] = url
+        return graph
+
+    raise OverpassUnavailableError(
+        "No Overpass server could provide the road network ("
+        + "; ".join(attempts)
+        + "). If https://overpass-api.de/api/status does not open in a browser on "
+        "this network, the network's IP address is being refused; try another "
+        "network, or set MHC_OVERPASS_URLS to a server you can reach."
+    )
+
+
+# ===========================
+# ROAD NETWORK DISK CACHE
+# ===========================
+def get_graph_cache_dir():
+    """Folder for processed road networks, or None if nothing is writable."""
+    custom_dir = os.environ.get("MHC_GRAPH_CACHE_DIR")
+    if custom_dir:
+        base = Path(custom_dir)
+    elif OSMNX_CACHE_DIR is not None:
+        base = Path(OSMNX_CACHE_DIR).parent / "road_networks"
+    else:
+        return None
+    try:
+        base = base.expanduser().resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    except Exception:
+        return None
+
+
+def _graph_cache_tag(network_type):
+    """Changes whenever the speed model changes, so stale graphs are not reused."""
+    speed_model = json.dumps(
+        [
+            GRAPH_CACHE_FORMAT_VERSION,
+            network_type,
+            SC_HIGHWAY_SPEEDS_KMH,
+            SC_FALLBACK_SPEED_KMH,
+            TURN_PENALTY_SECONDS,
+            WALKING_SPEED_KMH,
+        ],
+        sort_keys=True,
+    )
+    return f"{network_type}_{hashlib.sha1(speed_model.encode('utf-8')).hexdigest()[:8]}"
+
+
+def canonical_polygon_wkt(polygon):
+    """Rounded WKT so identical query areas produce identical cache keys."""
+    return wkt.dumps(polygon, rounding_precision=5, trim=True)
+
+
+def find_cached_graph_path(polygon, network_type):
+    """
+    Return the smallest cached graph whose area covers the requested polygon.
+
+    A graph downloaded for a longer travel time (or a larger site set) covers
+    any shorter-time query for the same sites, so it can be reused as-is.
+    """
+    cache_dir = get_graph_cache_dir()
+    if cache_dir is None:
+        return None
+
+    best_area, best_path = None, None
+    for wkt_path in cache_dir.glob(f"{_graph_cache_tag(network_type)}_*.wkt"):
+        graph_path = wkt_path.with_suffix(".pkl")
+        if not graph_path.exists():
+            continue
+        try:
+            cached_polygon = wkt.loads(wkt_path.read_text(encoding="utf-8"))
+            if not cached_polygon.covers(polygon):
+                continue
+        except Exception:
+            continue
+        if best_area is None or cached_polygon.area < best_area:
+            best_area, best_path = cached_polygon.area, graph_path
+    return best_path
+
+
+def save_graph_to_cache(G, polygon, network_type):
+    """Save a processed graph next to a .wkt file describing its coverage area."""
+    cache_dir = get_graph_cache_dir()
+    if cache_dir is None:
+        return
+    polygon_wkt = canonical_polygon_wkt(polygon)
+    digest = hashlib.sha1(polygon_wkt.encode("utf-8")).hexdigest()[:16]
+    stem = f"{_graph_cache_tag(network_type)}_{digest}"
+    graph_path = cache_dir / f"{stem}.pkl"
+    tmp_path = cache_dir / f"{stem}.pkl.tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, graph_path)
+        # Written last: a .wkt file only exists once its graph file is complete.
+        (cache_dir / f"{stem}.wkt").write_text(polygon_wkt, encoding="utf-8")
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _load_graph_file(path_str, mtime_ns):
+    """Load a cached graph once per process; mtime_ns refreshes it if rewritten."""
+    with open(path_str, "rb") as f:
+        return pickle.load(f)
+
+
+def _strip_edge_geometry(G):
+    """Edge geometry is only used for drawing, which this app does not do; drop it to save memory."""
+    for _, _, _, data in G.edges(keys=True, data=True):
+        data.pop("geometry", None)
+    return G
+
+
+def _get_graph_with_disk_cache(polygon, network_type, download_func):
+    cached_path = find_cached_graph_path(polygon, network_type)
+    if cached_path is not None:
+        try:
+            return _load_graph_file(str(cached_path), cached_path.stat().st_mtime_ns)
+        except Exception:
+            pass  # unreadable or incompatible cache file: download again
+
+    G = _download_osm_graph_with_cache_fallback(download_func)
+    G = preprocess_network_speeds(G, network_type)
+    _strip_edge_geometry(G)
+    save_graph_to_cache(G, polygon, network_type)
+    return G
+
+
+def _bbox_polygon_from_point(center_lat, center_lon, dist_m):
+    """Slightly conservative version of the bounding box OSMnx uses for graph_from_point."""
+    dlat = float(dist_m) / 111_320.0
+    dlon = float(dist_m) / (111_320.0 * max(np.cos(np.radians(center_lat)), 1e-6))
+    return box(center_lon - dlon, center_lat - dlat, center_lon + dlon, center_lat + dlat)
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
 def get_osm_graph(center_lat, center_lon, dist_m, network_type):
-    """Download/load an OSM network graph around a point with a cache-error fallback."""
+    """Load a cached graph or download one around a point."""
     def _download():
         return ox.graph_from_point(
             (center_lat, center_lon),
@@ -3216,13 +3542,15 @@ def get_osm_graph(center_lat, center_lon, dist_m, network_type):
             truncate_by_edge=True,
         )
 
-    G = _download_osm_graph_with_cache_fallback(_download)
-    return preprocess_network_speeds(G, network_type)
+    polygon = wkt.loads(canonical_polygon_wkt(
+        _bbox_polygon_from_point(center_lat, center_lon, dist_m)
+    ))
+    return _get_graph_with_disk_cache(polygon, network_type, _download)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=4)
 def get_osm_graph_for_polygon(polygon_wkt, network_type):
-    """Download/load an OSM network graph for a buffered analysis polygon."""
+    """Load a cached graph or download one for a buffered analysis polygon."""
     polygon = wkt.loads(polygon_wkt)
 
     def _download():
@@ -3233,8 +3561,7 @@ def get_osm_graph_for_polygon(polygon_wkt, network_type):
             truncate_by_edge=True,
         )
 
-    G = _download_osm_graph_with_cache_fallback(_download)
-    return preprocess_network_speeds(G, network_type)
+    return _get_graph_with_disk_cache(polygon, network_type, _download)
 
 
 def _valid_point_geometries(df):
@@ -3295,7 +3622,10 @@ def load_travel_time_graph(zip_geom, sites_df, max_time, network_type):
         try:
             if polygon is None or polygon.is_empty:
                 raise ValueError("Network query polygon could not be created.")
-            graph = get_osm_graph_for_polygon(polygon.wkt, network_type)
+            graph = get_osm_graph_for_polygon(canonical_polygon_wkt(polygon), network_type)
+        except OverpassUnavailableError:
+            # Every server already failed; a point-based query would fail the same way.
+            raise
         except Exception:
             center = zip_geom.centroid
             distance = estimate_required_graph_dist_m(
@@ -3500,6 +3830,9 @@ def main():
             **Network Analysis (optional):** OSM road network accessibility using
             free-flow travel times. Missing speeds are imputed by road class and
             travel is evaluated from demand block centroids to the selected MHC site.
+            Road networks are downloaded once per area and cached on this computer,
+            so repeat runs (including shorter travel times for the same sites) do
+            not contact the Overpass server.
 
             **Manhattan-style Distance (default):** Projected rectilinear distance
             x 1.2 circuity factor, converted to travel time. This is a fast
@@ -3879,7 +4212,7 @@ def main():
                 default_time = 5 if travel_mode == "drive" else 10
                 time_threshold = st.select_slider(
                     "Max Travel Time (min)",
-                    options=[5, 10, 15, 20, 30, 45],
+                    options=[5, 10, 15, 20],
                     value=default_time,
                 )
 
@@ -3978,10 +4311,13 @@ def main():
 
                 if use_network:
                     try:
-                        network_extent_candidates = candidates_in_zip
+                        # Size the road network from every candidate in the ZIP, not
+                        # just the filtered set, so changing site types or rerunning
+                        # after review exclusions reuses the same cached network.
+                        network_extent_candidates = candidates_zip_all
                         if previous_deployment_df is not None and not previous_deployment_df.empty:
                             network_extent_candidates = pd.concat(
-                                [candidates_in_zip, previous_deployment_df], ignore_index=True, sort=False
+                                [candidates_zip_all, previous_deployment_df], ignore_index=True, sort=False
                             )
                         with st.spinner("Loading roads within the travel-time search area..."):
                             G, search_speed = load_travel_time_graph(
