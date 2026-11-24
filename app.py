@@ -4300,7 +4300,7 @@ def main():
             st.markdown("##### Fleet size scenario analysis")
             run_resource_overview = st.toggle(
                 "Show fleet size scenario analysis after optimization",
-                value=True,
+                value=False,
                 help=(
                     "Runs best-plan coverage analysis from 1 through the selected scenario maximum. "
                     "The default maximum is 5 MHCs, capped by available candidate sites."
