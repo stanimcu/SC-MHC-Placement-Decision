@@ -97,11 +97,11 @@ These fields are not required for optimization, but they help translate model-se
 
 ### 9. Fleet-size scenario analysis
 
-The tool can run exact best-plan coverage analysis for multiple fleet sizes, such as 1 through 5 MHCs. This helps users compare marginal coverage gains and understand the potential benefit of adding another mobile clinic.
+The tool can run exact best-plan coverage analysis for multiple fleet sizes, such as 1 through 5 MHCs. This helps users compare marginal coverage gains and understand the potential benefit of adding another mobile clinic. It is off by default to keep runs fast; turn it on under **Advanced settings**.
 
 ### 10. Travel-time and distance modes
 
-The app uses **OSM road-network routing** by default and falls back to a fast **Manhattan-style distance** approximation if the road network cannot be downloaded. Users can also turn routing off to use the approximation directly. Drive and walk scenarios are supported with 5, 10, 15, or 20-minute thresholds.
+The app uses **road-network travel times precomputed with ArcGIS** by default, with OpenStreetMap routing and then a fast **Manhattan-style distance** approximation as fallbacks. Users can also turn routing off to use the approximation directly. Drive and walk scenarios are supported with 5, 10, 15, or 20-minute thresholds.
 
 ### 11. Interactive maps and plan comparison outputs
 
@@ -157,7 +157,11 @@ The app supports two accessibility modes.
 
 ### Road-network routing, default
 
-Road-network routing is enabled by default. The app uses OSMnx and NetworkX to build an OpenStreetMap drive or walk network around the selected ZIP's candidate sites, then computes free-flow travel time from each census block centroid to each candidate site.
+Road-network routing is enabled by default. Travel times from every census block centroid to every candidate site in South Carolina were precomputed with ArcGIS Network Analyst (time-neutral Driving Time and Walking Time, up to 20 minutes) and are stored in `data/arcgis_travel_times/`, so results load without downloading roads. If the input data change, these travel times must be rebuilt; until then the app uses the OpenStreetMap routing described below.
+
+### OpenStreetMap routing, fallback
+
+The app uses OSMnx and NetworkX to build an OpenStreetMap drive or walk network around the selected ZIP's candidate sites, then computes free-flow travel time from each census block centroid to each candidate site.
 
 - Driving speeds use OpenStreetMap speed limits where tagged. Missing speeds are filled by road class using South Carolina defaults, for example 105 km/h on motorways, 72 km/h on primary roads, and 40 km/h on residential streets.
 - Walking uses 5 km/h.
@@ -172,7 +176,7 @@ Important notes:
 - Road-network travel time is not live traffic.
 - Time-of-day congestion is not modeled.
 - OpenStreetMap coverage and road attributes may vary by location.
-- The published paper used ArcGIS Network Analyst and Esri StreetMap Premium; this open-source web implementation uses OSMnx for network routing.
+- The published paper used ArcGIS Network Analyst and Esri StreetMap Premium. The web tool's default travel times also come from ArcGIS Network Analyst.
 
 ### Manhattan-style distance
 
@@ -356,7 +360,7 @@ Important limitations:
 - Only census blocks in the loaded dataset are counted, so demand across state lines is excluded unless it is added to the input data.
 - Coverage percentage uses the demand reachable from eligible sites, so it changes with site filters and travel time.
 - Manhattan-style distance is a fast approximation, not a true road-network route.
-- Road-network estimates use OpenStreetMap-based free-flow routing and are not equivalent to live traffic or proprietary network travel-time models.
+- Road-network travel times are time-neutral and do not reflect live traffic.
 - Live traffic, time-of-day effects, transit access, seasonal demand, and patient preferences are not currently modeled.
 - The app evaluates driving and walking separately.
 
@@ -382,7 +386,7 @@ Tanim, S. H., White, D. L., Witrick, B., & Rennert, L. (2026). Optimizing mobile
 
 ### Web tool and source code
 
-Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health Clinic Placement Decision Tool* (Version v0.4) [Web application and source code].
+Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health Clinic Placement Decision Tool* (Version v0.5) [Web application and source code].
 
 - Web tool: https://sc-mhc-placement-decision.streamlit.app/
 - Source code: https://github.com/DMA-PRIME/SC-MHC-Placement-Decision
@@ -406,7 +410,7 @@ Tanim, S. H., Iuricich, F., & Rennert, L. (2026). *South Carolina Mobile Health 
   title = {South Carolina Mobile Health Clinic Placement Decision Tool},
   author = {Tanim, Shakhawat H. and Iuricich, Federico and Rennert, Lior},
   year = {2026},
-  version = {v0.4},
+  version = {v0.5},
   url = {https://github.com/DMA-PRIME/SC-MHC-Placement-Decision},
   note = {Web application: https://sc-mhc-placement-decision.streamlit.app/ accessed [date accessed]}
 }
@@ -426,7 +430,7 @@ cd SC-MHC-Placement-Decision
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 python -m pip install --upgrade pip
-python -m pip install streamlit pandas numpy geopandas shapely folium streamlit-folium osmnx networkx scikit-learn requests "pulp<4"
+python -m pip install streamlit pandas numpy geopandas shapely folium streamlit-folium osmnx networkx scikit-learn requests "pulp<4" highspy
 ```
 
 ### Option 2: conda, recommended on Windows for geospatial dependencies
@@ -437,7 +441,7 @@ cd SC-MHC-Placement-Decision
 conda create -n mhc-placement python=3.11 -y
 conda activate mhc-placement
 conda install -c conda-forge streamlit pandas numpy geopandas shapely folium osmnx networkx scikit-learn requests "pulp<4" -y
-python -m pip install streamlit-folium
+python -m pip install streamlit-folium highspy
 ```
 
 If the CBC solver is not available through PuLP in your environment, install CBC through conda-forge:
@@ -450,10 +454,11 @@ Dependency notes:
 
 - **PuLP must stay below version 4.** PuLP 4.0 removed `LpStatus` and the bundled CBC solver, so the app fails at startup with that version.
 - **scikit-learn is required for road-network routing.** OSMnx uses it to snap points to the road network. Without it, routing reports no reachable pairs.
+- **highspy is required on Apple Silicon Macs.** PuLP's bundled CBC solver does not run there, so the app uses the HiGHS solver instead.
 
 ### Requirements file for deployment
 
-Streamlit Community Cloud installs packages from `requirements.txt`. Keep the PuLP pin there as well:
+Streamlit Community Cloud installs packages from `requirements.txt`. Keep the PuLP pin and `highspy` there as well:
 
 ```text
 streamlit
@@ -468,6 +473,7 @@ networkx
 scikit-learn
 requests
 pulp<4
+highspy
 ```
 
 ### Configuration
@@ -536,6 +542,7 @@ The app will open in a browser window. If it does not open automatically, Stream
 ```text
 .
 |-- app.py
+|-- arcgis_travel_times.py  # reads the precomputed travel times
 |-- config.py              # local configuration; do not commit sensitive paths
 |-- requirements.txt       # dependency list used by Streamlit Community Cloud
 |-- README.md
@@ -543,6 +550,7 @@ The app will open in a browser window. If it does not open automatically, Stream
 |-- .streamlit/
 |   `-- secrets.toml       # optional road-network settings; do not commit
 |-- data/
+|   |-- arcgis_travel_times/  # precomputed ArcGIS travel times (drive, walk)
 |   `-- sc_mhc_input.json  # local data; avoid committing confidential data
 |-- docs/
 |   `-- screenshot.png     # optional screenshot for GitHub README
