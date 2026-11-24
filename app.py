@@ -27,6 +27,12 @@ Core changes retained and strengthened
 - Road-network downloads identify the app to Overpass, fail over across public
   Overpass servers, use a tighter search extent, and are cached on disk so
   repeat runs for the same area do not contact any server.
+- Uses travel times precomputed with ArcGIS network analysis when
+  data/arcgis_travel_times/<mode>/ is installed (built with
+  build_statewide_matrix.py and split_statewide_matrix.py), so road-network
+  runs need no download or routing in the app. OpenStreetMap stays available.
+- Falls back to the HiGHS solver (highspy) when PuLP's bundled CBC cannot run,
+  as on Apple Silicon Macs, and says so if no solver can run.
 
 Author: Tanim
 """
@@ -62,15 +68,31 @@ try:
     from pulp import PULP_CBC_CMD
 except Exception:  # PuLP 4 removes the legacy bundled CBC solver name
     PULP_CBC_CMD = None
+try:
+    # HiGHS (pip install highspy) runs natively everywhere, including Apple Silicon
+    # Macs, where PuLP's bundled CBC is an Intel-only binary.
+    from pulp import HiGHS
+except Exception:
+    HiGHS = None
 from shapely import wkt
 from shapely.geometry import Polygon, box
 from streamlit_folium import st_folium
 
 from config import JSON_PATH
 
+try:
+    from arcgis_travel_times import (
+        PrecomputedTravelTimes,
+        build_precomputed_coverage,
+        file_sha256,
+        precomputed_coverage_for_demand,
+    )
+except ImportError:  # without the module, ArcGIS travel times are simply not offered
+    PrecomputedTravelTimes = None
+
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "v0.4"
+APP_VERSION = "v0.5"
 
 
 # ===========================
@@ -585,6 +607,11 @@ NETWORK_QUERY_BUFFER_M_WALK = 2000
 NETWORK_SEARCH_SPEED_KMH = 115.0
 MAX_TIEBREAKER_ASSIGNMENT_PAIRS = 60000
 
+# Travel times precomputed with ArcGIS network analysis (build_statewide_matrix.py,
+# then split_statewide_matrix.py), stored in data/arcgis_travel_times/<mode>/.
+ROUTING_ARCGIS = "ArcGIS (precomputed)"
+ROUTING_OSM = "OpenStreetMap (computed in the app)"
+
 COVERAGE_ONLY_DIVERSITY_MODE = "Rank by coverage only"
 SITE_DISTINCT_DIVERSITY_MODE = "Prefer distinct alternatives"
 DEFAULT_DIVERSITY_MODE = SITE_DISTINCT_DIVERSITY_MODE
@@ -1049,6 +1076,7 @@ def apply_previous_deployment_adjustment(
     use_network,
     G,
     network_access_direction=NETWORK_ACCESS_DIRECTION,
+    arcgis_store=None,
 ):
     """Zero out demand already covered by a previous deployment.
 
@@ -1056,6 +1084,10 @@ def apply_previous_deployment_adjustment(
     coverage matrix also has previous-covered demand columns zeroed out, so plan
     maps show new coverage rather than counting overlapping demand as newly
     covered.
+
+    With arcgis_store, previous deployments at candidate sites use the
+    precomputed ArcGIS travel times; custom coordinates, which are not in the
+    precomputed file, use G (OpenStreetMap) or the Manhattan-style fallback.
     """
     n_dem = coverage_matrix.shape[1] if coverage_matrix is not None else 0
     base_weights = np.asarray(demand_weights, dtype=float)
@@ -1068,18 +1100,43 @@ def apply_previous_deployment_adjustment(
         return adjusted_matrix, adjusted_weights, previous_mask, 0.0, float(adjusted_weights.sum())
 
     try:
-        previous_coverage, _, _, _ = build_coverage_matrix(
-            previous_deployment_df,
-            demand_reset,
-            time_threshold,
-            network_type=travel_mode,
-            use_network=use_network,
-            G=G,
-            return_travel_time=True,
-            network_access_direction=network_access_direction,
-        )
-        if previous_coverage.shape[1] == n_dem and previous_coverage.shape[0] > 0:
-            previous_mask = previous_coverage.astype(bool).any(axis=0)
+        if arcgis_store is not None:
+            site_ids = pd.to_numeric(previous_deployment_df["cand_idx"], errors="coerce").fillna(-1).astype(int)
+            on_file = previous_deployment_df[site_ids.to_numpy() >= 0]
+            custom = previous_deployment_df[site_ids.to_numpy() < 0]
+            masks = []
+            if len(on_file):
+                file_coverage, _ = precomputed_coverage_for_demand(
+                    arcgis_store, on_file, demand_reset, time_threshold
+                )
+                masks.append(file_coverage.astype(bool).any(axis=0))
+            if len(custom):
+                custom_coverage, _, _, _ = build_coverage_matrix(
+                    custom,
+                    demand_reset,
+                    time_threshold,
+                    network_type=travel_mode,
+                    use_network=use_network,
+                    G=G,
+                    return_travel_time=True,
+                    network_access_direction=network_access_direction,
+                )
+                masks.append(custom_coverage.astype(bool).any(axis=0))
+            if masks:
+                previous_mask = np.logical_or.reduce(masks)
+        else:
+            previous_coverage, _, _, _ = build_coverage_matrix(
+                previous_deployment_df,
+                demand_reset,
+                time_threshold,
+                network_type=travel_mode,
+                use_network=use_network,
+                G=G,
+                return_travel_time=True,
+                network_access_direction=network_access_direction,
+            )
+            if previous_coverage.shape[1] == n_dem and previous_coverage.shape[0] > 0:
+                previous_mask = previous_coverage.astype(bool).any(axis=0)
     except Exception:
         previous_mask = np.zeros(n_dem, dtype=bool)
 
@@ -1109,6 +1166,7 @@ def make_analysis_params(
     previous_deployment_cand_idxs,
     previous_deployment_coordinates,
     exclude_previous_deployment_site,
+    routing_source=None,
 ):
     """A hashable-ish dictionary used to detect stale analysis results."""
     cand_idx_key = tuple(sorted({int(x) for x in (previous_deployment_cand_idxs or [])}))
@@ -1137,6 +1195,7 @@ def make_analysis_params(
         "travel_mode": str(travel_mode),
         "time_threshold": int(time_threshold),
         "use_network": bool(use_network),
+        "routing_source": str(routing_source),
         "num_mhcs": int(num_mhcs),
         "num_alternative_plans": int(num_alternative_plans),
         "diversity_mode": str(diversity_mode),
@@ -1538,7 +1597,7 @@ def get_overlap_limit(num_facilities, diversity_mode):
 
 
 def build_pulp_solver_candidates(msg=False):
-    """Return available PuLP solver objects, preferring the current CBC interface."""
+    """Return PuLP solver objects to try in order: CBC first, then HiGHS."""
     solvers = []
     for solver_cls in (COIN_CMD, PULP_CBC_CMD):
         if solver_cls is None:
@@ -1552,18 +1611,37 @@ def build_pulp_solver_candidates(msg=False):
                 continue
         except Exception:
             continue
+    if HiGHS is not None:
+        try:
+            highs = HiGHS(msg=bool(msg), gapRel=0.0)  # gap 0 keeps the MCLP solution exact
+            if highs.available():
+                solvers.append(highs)
+        except Exception:
+            pass
     return solvers
 
 
+# Errors from solvers that could not run, so the app can say so instead of
+# reporting that no feasible plan exists.
+SOLVER_FAILURES = []
+
+
 def solve_pulp_model(model, msg=False):
-    """Solve a PuLP model with a robust CBC/default-solver fallback."""
+    """Solve a PuLP model, moving on to the next solver if one cannot run or finish."""
     last_error = None
+    status = None
     for solver in build_pulp_solver_candidates(msg=msg):
         try:
-            return model.solve(solver)
+            status = model.solve(solver)
         except Exception as exc:
             last_error = exc
+            continue
+        if LpStatus.get(model.status, "") in {"Optimal", "Infeasible", "Unbounded"}:
+            return status
+        # "Not Solved" or "Undefined": this solver did not finish, so try the next one.
 
+    if status is not None:
+        return status
     try:
         return model.solve()
     except Exception:
@@ -1617,7 +1695,8 @@ def solve_maxcover_once(
 
     try:
         solve_pulp_model(model, msg=False)
-    except Exception:
+    except Exception as exc:
+        SOLVER_FAILURES.append(f"{type(exc).__name__}: {exc}")
         return []
 
     status_name = LpStatus.get(model.status, "")
@@ -3769,6 +3848,57 @@ def build_coverage_matrix(
 
 
 # ===========================
+# PRECOMPUTED ARCGIS TRAVEL TIMES
+# ===========================
+def get_arcgis_travel_time_dir():
+    custom_dir = os.environ.get("MHC_ARCGIS_TRAVEL_TIME_DIR")
+    if custom_dir:
+        return Path(custom_dir).expanduser()
+    return Path(__file__).resolve().parent / "data" / "arcgis_travel_times"
+
+
+@st.cache_data(show_spinner=False)
+def _cached_file_sha256(path_str, mtime_ns, size):
+    """Hash the app data once per file version, so the check costs nothing on reruns."""
+    return file_sha256(path_str)
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _load_arcgis_store(folder_str, index_mtime_ns):
+    return PrecomputedTravelTimes(folder_str)
+
+
+def get_arcgis_travel_times(travel_mode, candidates_df, demand_df):
+    """
+    Return (store, problem). store is None when precomputed ArcGIS travel times
+    cannot be used for this travel mode; problem then explains why, or is None
+    when no precomputed files are installed for the mode.
+    """
+    if PrecomputedTravelTimes is None:
+        return None, "arcgis_travel_times.py is missing"
+    folder = get_arcgis_travel_time_dir() / str(travel_mode)
+    index_path = folder / "index.json"
+    if not index_path.exists():
+        return None, None
+    try:
+        store = _load_arcgis_store(str(folder), index_path.stat().st_mtime_ns)
+    except Exception as exc:
+        return None, f"could not be read ({exc})"
+
+    json_path = Path(JSON_PATH)
+    try:
+        stat = json_path.stat()
+        data_sha = _cached_file_sha256(str(json_path.resolve()), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        data_sha = None
+    candidate_count = int(pd.to_numeric(candidates_df["cand_idx"]).max()) + 1
+    demand_count = int(pd.to_numeric(demand_df["dem_idx"]).max()) + 1
+    if data_sha is None or not store.matches(candidate_count, demand_count, data_sha):
+        return None, "were built for a different version of sc_app_data.json"
+    return store, None
+
+
+# ===========================
 # MAIN APP
 # ===========================
 def main():
@@ -3827,7 +3957,15 @@ def main():
             **Overview analytics:** The fleet size scenario analysis shows exact best-plan coverage
             and marginal gains from 1 through the configured sweep maximum, or fewer if fewer candidate sites are available.
 
-            **Network Analysis (optional):** OSM road network accessibility using
+            **Network Analysis, ArcGIS (used automatically when installed):** Travel times from
+            every census block centroid to every candidate site in South Carolina,
+            precomputed up to 20 minutes on an ArcGIS Enterprise routing
+            service (time-neutral Driving Time or Walking Time travel mode). Block
+            centroids and sites are placed on the network within 2 km; the few with
+            no road within 2 km have no coverage. Results load from stored files,
+            so no road network is downloaded.
+
+            **Network Analysis, OpenStreetMap (when no precomputed times are installed):** OSM road network accessibility using
             free-flow travel times. Missing speeds are imputed by road class and
             travel is evaluated from demand block centroids to the selected MHC site.
             Road networks are downloaded once per area and cached on this computer,
@@ -4216,6 +4354,26 @@ def main():
                     value=default_time,
                 )
 
+            # Road-network routing always uses the precomputed ArcGIS travel times
+            # when they are installed for this travel mode and match the data.
+            arcgis_store = None
+            routing_source = None
+            if use_network:
+                arcgis_store, arcgis_problem = get_arcgis_travel_times(travel_mode, candidates_df, demand_df)
+                if arcgis_store is not None and time_threshold > arcgis_store.max_time:
+                    arcgis_problem = f"cover up to {arcgis_store.max_time:g} minutes only"
+                    arcgis_store = None
+                if arcgis_store is not None:
+                    routing_source = ROUTING_ARCGIS
+                    st.caption("Road network: precomputed ArcGIS travel times.")
+                else:
+                    routing_source = ROUTING_OSM
+                    if arcgis_problem:
+                        st.caption(f"Precomputed ArcGIS {travel_mode} travel times {arcgis_problem}; using OpenStreetMap.")
+                    else:
+                        st.caption(f"No precomputed {travel_mode} travel times installed; using OpenStreetMap.")
+            use_arcgis = arcgis_store is not None
+
             #st.caption(f"{max_facilities:,} candidate sites remain after filters/exclusions.")
             #st.caption("Candidate sites stay in the selected ZIP. Demand coverage follows travel time across ZIP boundaries, using blocks available in the loaded dataset.")
 
@@ -4261,6 +4419,7 @@ def main():
         previous_deployment_cand_idxs=previous_deployment_cand_idxs,
         previous_deployment_coordinates=previous_deployment_coordinate_rows,
         exclude_previous_deployment_site=exclude_previous_deployment_site,
+        routing_source=routing_source,
     )
 
     if (
@@ -4309,7 +4468,27 @@ def main():
                 method_used = "Manhattan-style Distance"
                 previous_deployment_locations = previous_deployment_records_from_df(previous_deployment_df)
 
-                if use_network:
+                if use_arcgis:
+                    method_used = "Road Network (ArcGIS)"
+                    custom_previous = pd.DataFrame()
+                    if previous_deployment_df is not None and not previous_deployment_df.empty:
+                        prev_ids = pd.to_numeric(previous_deployment_df["cand_idx"], errors="coerce").fillna(-1)
+                        custom_previous = previous_deployment_df[prev_ids.to_numpy() < 0]
+                    if not custom_previous.empty:
+                        # Typed-in coordinates are not in the precomputed file; route them on OpenStreetMap.
+                        try:
+                            with st.spinner("Loading roads for the previous deployment coordinates..."):
+                                G, _ = load_travel_time_graph(zip_geom, custom_previous, time_threshold, travel_mode)
+                            method_used += "; previous deployment coordinates routed on OpenStreetMap"
+                        except Exception as e:
+                            G = None
+                            method_used += "; previous deployment coordinates use Manhattan-style distance"
+                            st.warning(
+                                "Roads for the previous deployment coordinates could not be loaded, so their "
+                                f"coverage uses Manhattan-style distance. Details: {e}"
+                            )
+
+                if use_network and not use_arcgis:
                     try:
                         # Size the road network from every candidate in the ZIP, not
                         # just the filtered set, so changing site types or rerunning
@@ -4337,16 +4516,22 @@ def main():
                             demand_df, candidates_in_zip, time_threshold, travel_mode, False
                         )
 
-                raw_coverage_matrix, candidates_reset, demand_reset, travel_time_matrix = build_coverage_matrix(
-                    candidates_in_zip,
-                    demand_search,
-                    time_threshold,
-                    network_type=travel_mode,
-                    use_network=use_network,
-                    G=G,
-                    return_travel_time=True,
-                    network_access_direction=NETWORK_ACCESS_DIRECTION,
-                )
+                if use_arcgis:
+                    with st.spinner("Reading precomputed ArcGIS travel times..."):
+                        raw_coverage_matrix, candidates_reset, demand_reset, travel_time_matrix = (
+                            build_precomputed_coverage(arcgis_store, candidates_in_zip, demand_df, time_threshold)
+                        )
+                else:
+                    raw_coverage_matrix, candidates_reset, demand_reset, travel_time_matrix = build_coverage_matrix(
+                        candidates_in_zip,
+                        demand_search,
+                        time_threshold,
+                        network_type=travel_mode,
+                        use_network=use_network,
+                        G=G,
+                        return_travel_time=True,
+                        network_access_direction=NETWORK_ACCESS_DIRECTION,
+                    )
 
                 if target_var not in demand_reset.columns:
                     st.error(f"The selected target variable is not available in the demand data: {target_var}")
@@ -4389,6 +4574,7 @@ def main():
                         use_network=use_network,
                         G=G,
                         network_access_direction=NETWORK_ACCESS_DIRECTION,
+                        arcgis_store=arcgis_store if use_arcgis else None,
                     )
                 )
                 previous_covered_dem_ids = (
@@ -4403,6 +4589,7 @@ def main():
                         "The generated results may show zero additional coverage."
                     )
 
+                SOLVER_FAILURES.clear()
                 plans = solve_top_k_maxcover(
                     coverage_matrix=coverage_matrix,
                     demand_weights=demand_weights,
@@ -4417,7 +4604,14 @@ def main():
                     travel_time_matrix=travel_time_matrix,
                 )
 
-                if not plans:
+                if not plans and SOLVER_FAILURES:
+                    st.error(
+                        "The optimization solver could not run on this computer, so no plan was made. "
+                        "Install HiGHS with `pip install highspy` in the terminal, then restart the app. "
+                        f"Details: {SOLVER_FAILURES[-1][:300]}"
+                    )
+                    st.session_state.view_mode = "zip"
+                elif not plans:
                     st.error("No feasible deployment plan could be generated with the current settings.")
                     st.session_state.view_mode = "zip"
                 else:
